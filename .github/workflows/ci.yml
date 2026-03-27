@@ -79,7 +79,7 @@ jobs:
       - name: Copy binary to VPS
         run: |
           ssh -i ~/.ssh/deploy_key ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
-            "mkdir -p /opt/relayd"
+            "mkdir -p /opt/relayd && chmod 755 /opt/relayd"
           scp -i ~/.ssh/deploy_key \
             relayd-server \
             ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/opt/relayd/relayd-server
