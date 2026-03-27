@@ -10,9 +10,27 @@ import (
 	"github.com/dlc-01/relayd/internal/proto"
 )
 
-func startFakeServer(t *testing.T) (controlAddr, dataAddr string, dataConnCh chan net.Conn) {
+func startEchoService(t *testing.T) string {
 	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go io.Copy(conn, conn)
+		}
+	}()
+	return ln.Addr().String()
+}
 
+func startFakeServer(t *testing.T, tunnelID, connID string) (ctrlAddr, dataAddr string, dataConnCh chan net.Conn) {
+	t.Helper()
 	dataConnCh = make(chan net.Conn, 1)
 
 	dataLn, err := net.Listen("tcp", "127.0.0.1:0")
@@ -36,7 +54,7 @@ func startFakeServer(t *testing.T) (controlAddr, dataAddr string, dataConnCh cha
 	if err != nil {
 		t.Fatal(err)
 	}
-	controlAddr = ctrlLn.Addr().String()
+	ctrlAddr = ctrlLn.Addr().String()
 	t.Cleanup(func() { ctrlLn.Close() })
 
 	go func() {
@@ -44,45 +62,33 @@ func startFakeServer(t *testing.T) (controlAddr, dataAddr string, dataConnCh cha
 		if err != nil {
 			return
 		}
-
 		msg, err := proto.Read(conn)
 		if err != nil || msg.Type != proto.TypeRegister {
 			conn.Close()
 			return
 		}
-
 		proto.Write(conn, proto.Message{Type: proto.TypeOK})
-
 		time.Sleep(50 * time.Millisecond)
 		proto.Write(conn, proto.Message{
-			Type:   proto.TypeConnect,
-			ConnID: "test-conn-1",
+			Type:     proto.TypeConnect,
+			ConnID:   connID,
+			TunnelID: tunnelID,
 		})
 	}()
 
-	return controlAddr, dataAddr, dataConnCh
+	return ctrlAddr, dataAddr, dataConnCh
 }
 
-func startEchoService(t *testing.T) string {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+func makeConfig(ctrlAddr, dataAddr string, tunnels []config.TunnelConfig) config.ClientConfig {
+	return config.ClientConfig{
+		ServerControlAddr: ctrlAddr,
+		ServerDataAddr:    dataAddr,
+		Tunnels:           tunnels,
+		Dev:               true,
 	}
-	t.Cleanup(func() { ln.Close() })
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go io.Copy(conn, conn)
-		}
-	}()
-	return ln.Addr().String()
 }
 
-func TestClient_Register(t *testing.T) {
+func TestClient_Register_SendsTunnels(t *testing.T) {
 	ctrlLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -90,29 +96,22 @@ func TestClient_Register(t *testing.T) {
 	defer ctrlLn.Close()
 
 	registerCh := make(chan proto.Message, 1)
-
 	go func() {
 		conn, err := ctrlLn.Accept()
 		if err != nil {
 			return
 		}
 		defer conn.Close()
-		msg, err := proto.Read(conn)
-		if err != nil {
-			return
-		}
+		msg, _ := proto.Read(conn)
 		registerCh <- msg
 		proto.Write(conn, proto.Message{Type: proto.TypeOK})
 		time.Sleep(500 * time.Millisecond)
 	}()
 
-	cfg := config.ClientConfig{
-		ServerControlAddr: ctrlLn.Addr().String(),
-		ServerDataAddr:    "127.0.0.1:1",
-		TunnelID:          "web",
-		LocalAddr:         "127.0.0.1:1",
-	}
-
+	cfg := makeConfig(ctrlLn.Addr().String(), "127.0.0.1:1", []config.TunnelConfig{
+		{TunnelID: "web", PublicPort: 10001, LocalAddr: "127.0.0.1:8080"},
+		{TunnelID: "ssh", PublicPort: 10022, LocalAddr: "127.0.0.1:22"},
+	})
 	go New(cfg).Run()
 
 	select {
@@ -120,103 +119,96 @@ func TestClient_Register(t *testing.T) {
 		if msg.Type != proto.TypeRegister {
 			t.Errorf("expected register, got %s", msg.Type)
 		}
-		if msg.TunnelID != "web" {
-			t.Errorf("expected tunnel_id=web, got %s", msg.TunnelID)
+		if len(msg.Tunnels) != 2 {
+			t.Fatalf("expected 2 tunnels, got %d", len(msg.Tunnels))
+		}
+		if msg.Tunnels[0].TunnelID != "web" || msg.Tunnels[0].PublicPort != 10001 {
+			t.Errorf("tunnel[0]: %+v", msg.Tunnels[0])
+		}
+		if msg.Tunnels[1].TunnelID != "ssh" || msg.Tunnels[1].PublicPort != 10022 {
+			t.Errorf("tunnel[1]: %+v", msg.Tunnels[1])
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timeout waiting for register")
 	}
 }
 
-func TestClient_HandleConnect(t *testing.T) {
-	echoAddr := startEchoService(t)
-	ctrlAddr, dataAddr, dataConnCh := startFakeServer(t)
+func TestClient_HandleConnect_CorrectTunnel(t *testing.T) {
+	echo1 := startEchoService(t)
+	echo2 := startEchoService(t)
+	ctrlAddr, dataAddr, dataConnCh := startFakeServer(t, "api", "conn-42")
 
-	cfg := config.ClientConfig{
-		ServerControlAddr: ctrlAddr,
-		ServerDataAddr:    dataAddr,
-		TunnelID:          "test",
-		LocalAddr:         echoAddr,
-	}
-
+	cfg := makeConfig(ctrlAddr, dataAddr, []config.TunnelConfig{
+		{TunnelID: "web", PublicPort: 10001, LocalAddr: echo1},
+		{TunnelID: "api", PublicPort: 10002, LocalAddr: echo2},
+	})
 	go New(cfg).Run()
 
-	var dataConn net.Conn
 	select {
-	case dataConn = <-dataConnCh:
+	case dataConn := <-dataConnCh:
+		defer dataConn.Close()
+		msg, err := proto.Read(dataConn)
+		if err != nil {
+			t.Fatalf("read data msg: %v", err)
+		}
+		if msg.Type != proto.TypeData {
+			t.Errorf("expected data, got %s", msg.Type)
+		}
+		if msg.ConnID != "conn-42" {
+			t.Errorf("expected conn-42, got %s", msg.ConnID)
+		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for data connection")
-	}
-	defer dataConn.Close()
-
-	msg, err := proto.Read(dataConn)
-	if err != nil {
-		t.Fatalf("read data msg: %v", err)
-	}
-	if msg.Type != proto.TypeData {
-		t.Errorf("expected data, got %s", msg.Type)
-	}
-	if msg.ConnID != "test-conn-1" {
-		t.Errorf("expected conn_id=test-conn-1, got %s", msg.ConnID)
+		t.Fatal("timeout")
 	}
 }
 
 func TestClient_EndToEnd_Echo(t *testing.T) {
 	echoAddr := startEchoService(t)
-	ctrlAddr, dataAddr, dataConnCh := startFakeServer(t)
+	ctrlAddr, dataAddr, dataConnCh := startFakeServer(t, "web", "conn-1")
 
-	cfg := config.ClientConfig{
-		ServerControlAddr: ctrlAddr,
-		ServerDataAddr:    dataAddr,
-		TunnelID:          "test",
-		LocalAddr:         echoAddr,
-	}
-
+	cfg := makeConfig(ctrlAddr, dataAddr, []config.TunnelConfig{
+		{TunnelID: "web", PublicPort: 10001, LocalAddr: echoAddr},
+	})
 	go New(cfg).Run()
 
 	var dataConn net.Conn
 	select {
 	case dataConn = <-dataConnCh:
 	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for data connection")
+		t.Fatal("timeout")
 	}
 	defer dataConn.Close()
 
 	_, err := proto.Read(dataConn)
 	if err != nil {
-		t.Fatalf("read data handshake: %v", err)
+		t.Fatalf("handshake: %v", err)
 	}
 
-	payload := "hello from client test"
+	payload := "hello multi-tunnel"
 	dataConn.Write([]byte(payload))
 
 	dataConn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	buf := make([]byte, len(payload))
-	_, err = io.ReadFull(dataConn, buf)
-	if err != nil {
-		t.Fatalf("read echo: %v", err)
+	if _, err := io.ReadFull(dataConn, buf); err != nil {
+		t.Fatalf("read: %v", err)
 	}
 	if string(buf) != payload {
 		t.Errorf("got %q, want %q", buf, payload)
 	}
 }
 
-func TestClient_LocalServiceUnavailable(t *testing.T) {
-	ctrlAddr, dataAddr, dataConnCh := startFakeServer(t)
+func TestClient_UnknownTunnelID(t *testing.T) {
+	ctrlAddr, dataAddr, dataConnCh := startFakeServer(t, "unknown", "conn-99")
 
-	cfg := config.ClientConfig{
-		ServerControlAddr: ctrlAddr,
-		ServerDataAddr:    dataAddr,
-		TunnelID:          "test",
-		LocalAddr:         "127.0.0.1:19999",
-	}
-
+	cfg := makeConfig(ctrlAddr, dataAddr, []config.TunnelConfig{
+		{TunnelID: "web", PublicPort: 10001, LocalAddr: "127.0.0.1:8080"},
+	})
 	go New(cfg).Run()
 
 	select {
 	case conn := <-dataConnCh:
 		conn.Close()
-		t.Error("expected no data connection when local service is down")
+		t.Error("expected no data connection for unknown tunnel_id")
 	case <-time.After(500 * time.Millisecond):
 	}
 }

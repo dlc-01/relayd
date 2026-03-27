@@ -7,11 +7,17 @@ import (
 
 func TestWriteRead_AllTypes(t *testing.T) {
 	cases := []Message{
-		{Type: TypeRegister, TunnelID: "web"},
+		{
+			Type: TypeRegister,
+			Tunnels: []TunnelDef{
+				{TunnelID: "web", PublicPort: 10001},
+				{TunnelID: "ssh", PublicPort: 10022},
+			},
+		},
 		{Type: TypeOK},
-		{Type: TypeConnect, ConnID: "abc-123"},
+		{Type: TypeConnect, ConnID: "abc-123", TunnelID: "web"},
 		{Type: TypeData, ConnID: "abc-123"},
-		{TypeError, "", "", "something went wrong"},
+		{Type: TypeError, Reason: "port already in use"},
 	}
 
 	for _, msg := range cases {
@@ -43,6 +49,14 @@ func TestWriteRead_AllTypes(t *testing.T) {
 			if got.Reason != msg.Reason {
 				t.Errorf("reason: got %s, want %s", got.Reason, msg.Reason)
 			}
+			if len(got.Tunnels) != len(msg.Tunnels) {
+				t.Fatalf("tunnels len: got %d, want %d", len(got.Tunnels), len(msg.Tunnels))
+			}
+			for i := range msg.Tunnels {
+				if got.Tunnels[i] != msg.Tunnels[i] {
+					t.Errorf("tunnel[%d]: got %+v, want %+v", i, got.Tunnels[i], msg.Tunnels[i])
+				}
+			}
 		})
 	}
 }
@@ -52,9 +66,7 @@ func TestRead_InvalidJSON(t *testing.T) {
 	defer server.Close()
 	defer client.Close()
 
-	go func() {
-		server.Write([]byte("not json\n"))
-	}()
+	go func() { server.Write([]byte("not json\n")) }()
 
 	_, err := Read(client)
 	if err == nil {
@@ -66,9 +78,7 @@ func TestRead_ConnectionClosed(t *testing.T) {
 	server, client := net.Pipe()
 	defer client.Close()
 
-	go func() {
-		server.Close()
-	}()
+	go func() { server.Close() }()
 
 	_, err := Read(client)
 	if err == nil {

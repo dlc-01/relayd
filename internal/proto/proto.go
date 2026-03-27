@@ -18,9 +18,15 @@ const (
 
 type Message struct {
 	Type     MessageType `json:"type"`
+	Tunnels  []TunnelDef `json:"tunnels,omitempty"`
 	TunnelID string      `json:"tunnel_id,omitempty"`
 	ConnID   string      `json:"conn_id,omitempty"`
 	Reason   string      `json:"reason,omitempty"`
+}
+
+type TunnelDef struct {
+	TunnelID   string `json:"tunnel_id"`
+	PublicPort int    `json:"public_port"`
 }
 
 func Write(conn net.Conn, msg Message) error {
