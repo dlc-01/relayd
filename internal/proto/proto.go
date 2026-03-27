@@ -14,6 +14,8 @@ const (
 	TypeConnect  MessageType = "connect"
 	TypeData     MessageType = "data"
 	TypeError    MessageType = "error"
+	TypePing     MessageType = "ping"
+	TypePong     MessageType = "pong"
 )
 
 type TunnelDef struct {

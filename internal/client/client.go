@@ -1,8 +1,10 @@
 package client
 
 import (
+	"fmt"
 	"io"
 	"net"
+	"time"
 
 	"github.com/dlc-01/relayd/internal/config"
 	"github.com/dlc-01/relayd/internal/logger"
@@ -11,9 +13,13 @@ import (
 )
 
 type Client struct {
-	cfg     config.ClientConfig
-	log     *zap.SugaredLogger
-	tunnels map[string]string
+	cfg               config.ClientConfig
+	log               *zap.SugaredLogger
+	tunnels           map[string]string
+	heartbeatInterval time.Duration
+	heartbeatTimeout  time.Duration
+	reconnectInitial  time.Duration
+	reconnectMax      time.Duration
 }
 
 func New(cfg config.ClientConfig) *Client {
@@ -27,16 +33,38 @@ func New(cfg config.ClientConfig) *Client {
 	for _, t := range cfg.Tunnels {
 		tunnels[t.TunnelID] = t.LocalAddr
 	}
-	return &Client{cfg: cfg, log: log, tunnels: tunnels}
+	return &Client{
+		cfg:               cfg,
+		log:               log,
+		tunnels:           tunnels,
+		heartbeatInterval: 30 * time.Second,
+		heartbeatTimeout:  10 * time.Second,
+		reconnectInitial:  1 * time.Second,
+		reconnectMax:      30 * time.Second,
+	}
 }
 
 func (c *Client) Run() {
-	ctrl, err := net.Dial("tcp", c.cfg.ServerControlAddr)
+	backoff := c.reconnectInitial
+	for {
+		err := c.connect()
+		if err != nil {
+			c.log.Warnw("connection failed, reconnecting", "err", err, "backoff", backoff)
+		} else {
+			c.log.Warnw("disconnected, reconnecting", "backoff", backoff)
+		}
+		time.Sleep(backoff)
+		backoff *= 2
+		if backoff > c.reconnectMax {
+			backoff = c.reconnectMax
+		}
+	}
+}
+
+func (c *Client) connect() error {
+	ctrl, err := net.DialTimeout("tcp", c.cfg.ServerControlAddr, 10*time.Second)
 	if err != nil {
-		c.log.Fatalw("dial control failed",
-			"addr", c.cfg.ServerControlAddr,
-			"err", err,
-		)
+		return err
 	}
 	defer ctrl.Close()
 
@@ -54,18 +82,18 @@ func (c *Client) Run() {
 		Type:    proto.TypeRegister,
 		Tunnels: defs,
 	}); err != nil {
-		c.log.Fatalw("register failed", "err", err)
+		return err
 	}
 
 	msg, err := proto.Read(ctrl)
 	if err != nil {
-		c.log.Fatalw("read register response failed", "err", err)
+		return err
 	}
 	if msg.Type == proto.TypeError {
 		c.log.Fatalw("register rejected", "reason", msg.Reason)
 	}
 	if msg.Type != proto.TypeOK {
-		c.log.Fatalw("unexpected register response", "type", msg.Type)
+		return fmt.Errorf("unexpected register response: %s", msg.Type)
 	}
 
 	c.log.Infow("registered tunnels", "count", len(c.cfg.Tunnels))
@@ -79,17 +107,44 @@ func (c *Client) Run() {
 		)
 	}
 
+	done := make(chan struct{})
+	defer close(done)
+	go c.heartbeat(ctrl, done)
+
 	for {
 		msg, err := proto.Read(ctrl)
 		if err != nil {
-			c.log.Errorw("control read failed", "err", err)
-			return
+			return err
 		}
-		if msg.Type != proto.TypeConnect {
+		switch msg.Type {
+		case proto.TypeConnect:
+			go c.handleConnect(msg.ConnID, msg.TunnelID)
+		case proto.TypePong:
+			c.log.Debugw("pong received")
+		default:
 			c.log.Warnw("unexpected message", "type", msg.Type)
-			continue
 		}
-		go c.handleConnect(msg.ConnID, msg.TunnelID)
+	}
+}
+
+func (c *Client) heartbeat(ctrl net.Conn, done chan struct{}) {
+	ticker := time.NewTicker(c.heartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			ctrl.SetWriteDeadline(time.Now().Add(c.heartbeatTimeout))
+			if err := proto.Write(ctrl, proto.Message{Type: proto.TypePing}); err != nil {
+				c.log.Warnw("heartbeat send failed", "err", err)
+				ctrl.Close()
+				return
+			}
+			ctrl.SetWriteDeadline(time.Time{})
+			c.log.Debugw("ping sent")
+		}
 	}
 }
 

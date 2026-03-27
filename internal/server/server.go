@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/dlc-01/relayd/internal/config"
 	"github.com/dlc-01/relayd/internal/httpparse"
@@ -219,15 +220,35 @@ func (s *Server) handleControl(ctrl net.Conn) {
 		"tunnels", len(msg.Tunnels),
 	)
 
-	buf := make([]byte, 1)
-	ctrl.Read(buf)
+	s.readControlLoop(ctrl, session)
 
 	s.log.Infow("client disconnected",
 		"remote", remote,
 		"session_id", session.id,
 	)
-
 	s.removeSession(session)
+}
+
+func (s *Server) readControlLoop(ctrl net.Conn, session *clientSession) {
+	for {
+		msg, err := proto.Read(ctrl)
+		if err != nil {
+			return
+		}
+		switch msg.Type {
+		case proto.TypePing:
+			s.log.Debugw("ping received", "session_id", session.id)
+			if err := proto.Write(ctrl, proto.Message{Type: proto.TypePong}); err != nil {
+				s.log.Warnw("pong failed", "session_id", session.id, "err", err)
+				return
+			}
+		default:
+			s.log.Warnw("unexpected control msg",
+				"session_id", session.id,
+				"type", msg.Type,
+			)
+		}
+	}
 }
 
 func (s *Server) removeSession(session *clientSession) {
@@ -428,6 +449,21 @@ func (s *Server) sendConnect(conn net.Conn, peeked []byte, tunnelID string, ctrl
 	s.mu.Lock()
 	s.pending[connID] = pendingConn{conn: conn, peeked: peeked}
 	s.mu.Unlock()
+
+	go func() {
+		time.Sleep(s.cfg.PendingTimeout)
+		s.mu.Lock()
+		pc, ok := s.pending[connID]
+		if ok {
+			delete(s.pending, connID)
+			s.log.Warnw("pending connection timeout",
+				"conn_id", connID,
+				"tunnel_id", tunnelID,
+			)
+			pc.conn.Close()
+		}
+		s.mu.Unlock()
+	}()
 
 	if err := proto.Write(ctrl, proto.Message{
 		Type:     proto.TypeConnect,

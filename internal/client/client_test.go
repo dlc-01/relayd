@@ -88,6 +88,15 @@ func makeConfig(ctrlAddr, dataAddr string, tunnels []config.TunnelConfig) config
 	}
 }
 
+func newTestClient(cfg config.ClientConfig) *Client {
+	c := New(cfg)
+	c.heartbeatInterval = 50 * time.Millisecond
+	c.heartbeatTimeout = 50 * time.Millisecond
+	c.reconnectInitial = 10 * time.Millisecond
+	c.reconnectMax = 100 * time.Millisecond
+	return c
+}
+
 func TestClient_Register_SendsTunnels(t *testing.T) {
 	ctrlLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -133,6 +142,200 @@ func TestClient_Register_SendsTunnels(t *testing.T) {
 	}
 }
 
+func TestClient_Reconnect(t *testing.T) {
+	connectCount := 0
+	connectCh := make(chan struct{}, 10)
+
+	ctrlLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctrlLn.Close()
+
+	go func() {
+		for {
+			conn, err := ctrlLn.Accept()
+			if err != nil {
+				return
+			}
+			connectCount++
+			connectCh <- struct{}{}
+			msg, err := proto.Read(conn)
+			if err != nil || msg.Type != proto.TypeRegister {
+				conn.Close()
+				continue
+			}
+			proto.Write(conn, proto.Message{Type: proto.TypeOK})
+			time.Sleep(50 * time.Millisecond)
+			conn.Close()
+		}
+	}()
+
+	cfg := makeConfig(ctrlLn.Addr().String(), "127.0.0.1:1", []config.TunnelConfig{
+		{TunnelID: "web", PublicPort: 10001, LocalAddr: "127.0.0.1:8080"},
+	})
+
+	go newTestClient(cfg).Run()
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-connectCh:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timeout waiting for connection %d", i+1)
+		}
+	}
+
+	if connectCount < 2 {
+		t.Errorf("expected at least 2 connects, got %d", connectCount)
+	}
+}
+
+func TestClient_Reconnect_BackoffIncrements(t *testing.T) {
+	connectTimes := make([]time.Time, 0, 5)
+	connectCh := make(chan time.Time, 10)
+
+	ctrlLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctrlLn.Close()
+
+	go func() {
+		for {
+			conn, err := ctrlLn.Accept()
+			if err != nil {
+				return
+			}
+			connectCh <- time.Now()
+			conn.Close()
+		}
+	}()
+
+	cfg := makeConfig(ctrlLn.Addr().String(), "127.0.0.1:1", []config.TunnelConfig{
+		{TunnelID: "web", PublicPort: 10001, LocalAddr: "127.0.0.1:8080"},
+	})
+
+	c := New(cfg)
+	c.reconnectInitial = 10 * time.Millisecond
+	c.reconnectMax = 200 * time.Millisecond
+	go c.Run()
+
+	for i := 0; i < 4; i++ {
+		select {
+		case ts := <-connectCh:
+			connectTimes = append(connectTimes, ts)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timeout at connect %d", i+1)
+		}
+	}
+
+	if len(connectTimes) < 3 {
+		t.Fatal("not enough connects to measure backoff")
+	}
+
+	gap1 := connectTimes[1].Sub(connectTimes[0])
+	gap2 := connectTimes[2].Sub(connectTimes[1])
+
+	if gap2 <= gap1 {
+		t.Errorf("backoff should increase: gap1=%v gap2=%v", gap1, gap2)
+	}
+}
+
+func TestClient_Heartbeat(t *testing.T) {
+	ctrlLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctrlLn.Close()
+
+	pingCh := make(chan struct{}, 10)
+
+	go func() {
+		conn, err := ctrlLn.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		msg, err := proto.Read(conn)
+		if err != nil || msg.Type != proto.TypeRegister {
+			return
+		}
+		proto.Write(conn, proto.Message{Type: proto.TypeOK})
+
+		for {
+			msg, err := proto.Read(conn)
+			if err != nil {
+				return
+			}
+			if msg.Type == proto.TypePing {
+				pingCh <- struct{}{}
+				proto.Write(conn, proto.Message{Type: proto.TypePong})
+			}
+		}
+	}()
+
+	cfg := makeConfig(ctrlLn.Addr().String(), "127.0.0.1:1", []config.TunnelConfig{
+		{TunnelID: "web", PublicPort: 10001, LocalAddr: "127.0.0.1:8080"},
+	})
+
+	c := New(cfg)
+	c.heartbeatInterval = 50 * time.Millisecond
+	go c.Run()
+
+	select {
+	case <-pingCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for ping")
+	}
+}
+
+func TestClient_Heartbeat_ReconnectsOnFailure(t *testing.T) {
+	connectCh := make(chan struct{}, 10)
+
+	ctrlLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctrlLn.Close()
+
+	go func() {
+		for {
+			conn, err := ctrlLn.Accept()
+			if err != nil {
+				return
+			}
+			connectCh <- struct{}{}
+			msg, err := proto.Read(conn)
+			if err != nil || msg.Type != proto.TypeRegister {
+				conn.Close()
+				continue
+			}
+			proto.Write(conn, proto.Message{Type: proto.TypeOK})
+			time.Sleep(500 * time.Millisecond)
+			conn.Close()
+		}
+	}()
+
+	cfg := makeConfig(ctrlLn.Addr().String(), "127.0.0.1:1", []config.TunnelConfig{
+		{TunnelID: "web", PublicPort: 10001, LocalAddr: "127.0.0.1:8080"},
+	})
+
+	c := New(cfg)
+	c.heartbeatInterval = 50 * time.Millisecond
+	c.heartbeatTimeout = 50 * time.Millisecond
+	c.reconnectInitial = 10 * time.Millisecond
+	go c.Run()
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-connectCh:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timeout waiting for reconnect %d", i+1)
+		}
+	}
+}
+
 func TestClient_HandleConnect_TCP(t *testing.T) {
 	echoAddr := startEchoService(t)
 	ctrlAddr, dataAddr, dataConnCh := startFakeServer(t, "web", "conn-1")
@@ -165,12 +368,7 @@ func TestClient_HandleConnect_WithAlias(t *testing.T) {
 	ctrlAddr, dataAddr, dataConnCh := startFakeServer(t, "app", "conn-2")
 
 	cfg := makeConfig(ctrlAddr, dataAddr, []config.TunnelConfig{
-		{
-			TunnelID:  "app",
-			Host:      "app.example.com",
-			Hosts:     []string{"alias.example.com"},
-			LocalAddr: echoAddr,
-		},
+		{TunnelID: "app", Host: "app.example.com", Hosts: []string{"alias.example.com"}, LocalAddr: echoAddr},
 	})
 	go New(cfg).Run()
 
@@ -211,7 +409,7 @@ func TestClient_EndToEnd_Echo(t *testing.T) {
 		t.Fatalf("handshake: %v", err)
 	}
 
-	payload := "hello aliasing"
+	payload := "hello stage6"
 	dataConn.Write([]byte(payload))
 
 	dataConn.SetReadDeadline(time.Now().Add(2 * time.Second))

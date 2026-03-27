@@ -19,6 +19,8 @@ func TestWriteRead_AllTypes(t *testing.T) {
 		{Type: TypeConnect, ConnID: "abc-123", TunnelID: "web"},
 		{Type: TypeData, ConnID: "abc-123"},
 		{Type: TypeError, Reason: "port already in use"},
+		{Type: TypePing},
+		{Type: TypePong},
 	}
 
 	for _, msg := range cases {

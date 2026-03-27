@@ -40,14 +40,15 @@ func freePort(t *testing.T) int {
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
 	cfg := config.ServerConfig{
-		ControlAddr:   freeAddr(t),
-		DataAddr:      freeAddr(t),
-		HTTPAddr:      freeAddr(t),
-		TLSAddr:       freeAddr(t),
-		TLSDomain:     "example.com",
-		MinPublicPort: 1024,
-		MaxPublicPort: 65535,
-		Dev:           true,
+		ControlAddr:    freeAddr(t),
+		DataAddr:       freeAddr(t),
+		HTTPAddr:       freeAddr(t),
+		TLSAddr:        freeAddr(t),
+		TLSDomain:      "example.com",
+		MinPublicPort:  1024,
+		MaxPublicPort:  65535,
+		PendingTimeout: 30 * time.Second,
+		Dev:            true,
 	}
 	s := New(cfg)
 	go s.listenControl()
@@ -574,5 +575,75 @@ func TestServer_AliasCleanupOnDisconnect(t *testing.T) {
 	msg, _ := proto.Read(ctrl2)
 	if msg.Type != proto.TypeOK {
 		t.Errorf("expected ok after alias freed, got %s reason=%s", msg.Type, msg.Reason)
+	}
+}
+func TestServer_Heartbeat(t *testing.T) {
+	s := newTestServer(t)
+
+	ctrl, _ := net.Dial("tcp", s.cfg.ControlAddr)
+	defer ctrl.Close()
+
+	proto.Write(ctrl, proto.Message{
+		Type:    proto.TypeRegister,
+		Tunnels: []proto.TunnelDef{{TunnelID: "web", Host: "app.example.com"}},
+	})
+	proto.Read(ctrl)
+
+	if err := proto.Write(ctrl, proto.Message{Type: proto.TypePing}); err != nil {
+		t.Fatalf("write ping: %v", err)
+	}
+
+	ctrl.SetReadDeadline(time.Now().Add(2 * time.Second))
+	msg, err := proto.Read(ctrl)
+	if err != nil {
+		t.Fatalf("read pong: %v", err)
+	}
+	if msg.Type != proto.TypePong {
+		t.Errorf("expected pong, got %s", msg.Type)
+	}
+}
+
+func TestServer_PendingTimeout(t *testing.T) {
+	cfg := config.ServerConfig{
+		ControlAddr:    freeAddr(t),
+		DataAddr:       freeAddr(t),
+		HTTPAddr:       freeAddr(t),
+		TLSAddr:        freeAddr(t),
+		TLSDomain:      "example.com",
+		MinPublicPort:  1024,
+		MaxPublicPort:  65535,
+		PendingTimeout: 500 * time.Millisecond,
+		Dev:            true,
+	}
+	s := New(cfg)
+	go s.listenControl()
+	go s.listenData()
+	go s.listenHTTP()
+	go s.listenTLS()
+	time.Sleep(50 * time.Millisecond)
+
+	ctrl, _ := net.Dial("tcp", s.cfg.ControlAddr)
+	defer ctrl.Close()
+
+	proto.Write(ctrl, proto.Message{
+		Type:    proto.TypeRegister,
+		Tunnels: []proto.TunnelDef{{TunnelID: "web", Host: "app.example.com"}},
+	})
+	proto.Read(ctrl)
+	time.Sleep(50 * time.Millisecond)
+
+	httpConn, err := net.Dial("tcp", s.cfg.HTTPAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer httpConn.Close()
+
+	httpConn.Write([]byte("GET / HTTP/1.1\r\nHost: app.example.com\r\n\r\n"))
+
+	httpConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, 1)
+	_, err = httpConn.Read(buf)
+	if err == nil {
+		t.Error("expected connection to be closed after pending timeout")
 	}
 }

@@ -4,20 +4,22 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type ServerConfig struct {
-	ControlAddr   string
-	DataAddr      string
-	HTTPAddr      string
-	TLSAddr       string
-	TLSCertFile   string
-	TLSKeyFile    string
-	TLSDomain     string
-	TLSDomains    []DomainCert
-	MinPublicPort int
-	MaxPublicPort int
-	Dev           bool
+	ControlAddr    string
+	DataAddr       string
+	HTTPAddr       string
+	TLSAddr        string
+	TLSCertFile    string
+	TLSKeyFile     string
+	TLSDomain      string
+	TLSDomains     []DomainCert
+	MinPublicPort  int
+	MaxPublicPort  int
+	PendingTimeout time.Duration
+	Dev            bool
 }
 
 type TunnelConfig struct {
@@ -43,16 +45,17 @@ type DomainCert struct {
 
 func LoadServerConfig() ServerConfig {
 	cfg := ServerConfig{
-		ControlAddr:   getEnv("RELAYD_CONTROL_ADDR", "0.0.0.0:7000"),
-		DataAddr:      getEnv("RELAYD_DATA_ADDR", "0.0.0.0:7001"),
-		HTTPAddr:      getEnv("RELAYD_HTTP_ADDR", "0.0.0.0:80"),
-		TLSAddr:       getEnv("RELAYD_TLS_ADDR", "0.0.0.0:443"),
-		TLSCertFile:   getEnv("RELAYD_TLS_CERT", ""),
-		TLSKeyFile:    getEnv("RELAYD_TLS_KEY", ""),
-		TLSDomain:     getEnv("RELAYD_TLS_DOMAIN", "localhost"),
-		MinPublicPort: getEnvInt("RELAYD_MIN_PORT", 10000),
-		MaxPublicPort: getEnvInt("RELAYD_MAX_PORT", 60000),
-		Dev:           getEnv("RELAYD_DEV", "false") == "true",
+		ControlAddr:    getEnv("RELAYD_CONTROL_ADDR", "0.0.0.0:7000"),
+		DataAddr:       getEnv("RELAYD_DATA_ADDR", "0.0.0.0:7001"),
+		HTTPAddr:       getEnv("RELAYD_HTTP_ADDR", "0.0.0.0:80"),
+		TLSAddr:        getEnv("RELAYD_TLS_ADDR", "0.0.0.0:443"),
+		TLSCertFile:    getEnv("RELAYD_TLS_CERT", ""),
+		TLSKeyFile:     getEnv("RELAYD_TLS_KEY", ""),
+		TLSDomain:      getEnv("RELAYD_TLS_DOMAIN", "localhost"),
+		MinPublicPort:  getEnvInt("RELAYD_MIN_PORT", 10000),
+		MaxPublicPort:  getEnvInt("RELAYD_MAX_PORT", 60000),
+		PendingTimeout: getEnvDuration("RELAYD_PENDING_TIMEOUT", 30*time.Second),
+		Dev:            getEnv("RELAYD_DEV", "false") == "true",
 	}
 
 	if raw := getEnv("RELAYD_TLS_DOMAINS", ""); raw != "" {
@@ -70,6 +73,15 @@ func LoadServerConfig() ServerConfig {
 	}
 
 	return cfg
+}
+
+func getEnvDuration(key string, fallback time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return fallback
 }
 
 func LoadClientConfig() ClientConfig {
