@@ -81,11 +81,13 @@ jobs:
 
       - name: Copy binary to VPS
         run: |
-          ssh -i ~/.ssh/deploy_key ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
-            "mkdir -p /opt/relayd && chmod 755 /opt/relayd"
-          scp -i ~/.ssh/deploy_key \
-            relayd-server \
-            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/opt/relayd/relayd-server
+            ssh -i ~/.ssh/deploy_key ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+              "mkdir -p /opt/relayd && chmod 755 /opt/relayd"
+            scp -i ~/.ssh/deploy_key \
+              relayd-server \
+              ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/opt/relayd/relayd-server.new
+            ssh -i ~/.ssh/deploy_key ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+              "mv /opt/relayd/relayd-server.new /opt/relayd/relayd-server && chmod +x /opt/relayd/relayd-server"
 
       - name: Update systemd and restart
         run: |
