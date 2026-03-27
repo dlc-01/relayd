@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"github.com/dlc-01/relayd/internal/logger"
 	"github.com/dlc-01/relayd/internal/portcheck"
 	"github.com/dlc-01/relayd/internal/proto"
+	"github.com/dlc-01/relayd/internal/tlscerts"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
@@ -51,6 +53,7 @@ func (s *Server) Run() {
 	go s.listenControl()
 	go s.listenData()
 	go s.listenHTTP()
+	go s.listenTLS()
 	select {}
 }
 
@@ -60,7 +63,6 @@ func (s *Server) listenControl() {
 		s.log.Fatalw("control listen failed", "addr", s.cfg.ControlAddr, "err", err)
 	}
 	s.log.Infow("control listening", "addr", s.cfg.ControlAddr)
-
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -78,30 +80,18 @@ func (s *Server) handleControl(ctrl net.Conn) {
 
 	msg, err := proto.Read(ctrl)
 	if err != nil || msg.Type != proto.TypeRegister {
-		s.log.Warnw("expected register",
-			"remote", remote,
-			"got", msg.Type,
-			"err", err,
-		)
+		s.log.Warnw("expected register", "remote", remote, "got", msg.Type, "err", err)
 		return
 	}
 
 	if len(msg.Tunnels) == 0 {
-		s.log.Warnw("register with no tunnels", "remote", remote)
-		proto.Write(ctrl, proto.Message{
-			Type:   proto.TypeError,
-			Reason: "no tunnels in register",
-		})
+		proto.Write(ctrl, proto.Message{Type: proto.TypeError, Reason: "no tunnels in register"})
 		return
 	}
 
-	// базовая валидация
 	for _, t := range msg.Tunnels {
 		if t.TunnelID == "" {
-			proto.Write(ctrl, proto.Message{
-				Type:   proto.TypeError,
-				Reason: "tunnel_id cannot be empty",
-			})
+			proto.Write(ctrl, proto.Message{Type: proto.TypeError, Reason: "tunnel_id cannot be empty"})
 			return
 		}
 		if t.PublicPort == 0 && t.Host == "" {
@@ -113,17 +103,11 @@ func (s *Server) handleControl(ctrl net.Conn) {
 		}
 	}
 
-	// шаг 1 — проверяем конфликты в наших мапах
 	s.mu.Lock()
 	for _, t := range msg.Tunnels {
 		if t.PublicPort != 0 {
 			if existing, ok := s.ports[t.PublicPort]; ok {
 				s.mu.Unlock()
-				s.log.Warnw("port conflict",
-					"remote", remote,
-					"port", t.PublicPort,
-					"occupied_by", existing,
-				)
 				proto.Write(ctrl, proto.Message{
 					Type:   proto.TypeError,
 					Reason: fmt.Sprintf("port %d already in use by tunnel %s", t.PublicPort, existing),
@@ -134,11 +118,6 @@ func (s *Server) handleControl(ctrl net.Conn) {
 		if t.Host != "" {
 			if existing, ok := s.hosts[t.Host]; ok {
 				s.mu.Unlock()
-				s.log.Warnw("host conflict",
-					"remote", remote,
-					"host", t.Host,
-					"occupied_by", existing,
-				)
 				proto.Write(ctrl, proto.Message{
 					Type:   proto.TypeError,
 					Reason: fmt.Sprintf("host %s already in use by tunnel %s", t.Host, existing),
@@ -149,16 +128,9 @@ func (s *Server) handleControl(ctrl net.Conn) {
 	}
 	s.mu.Unlock()
 
-	// шаг 2 — проверяем системные порты через portcheck
 	for _, t := range msg.Tunnels {
 		if t.PublicPort != 0 {
 			if err := portcheck.Check(t.PublicPort, s.cfg.MinPublicPort, s.cfg.MaxPublicPort); err != nil {
-				s.log.Warnw("port check failed",
-					"remote", remote,
-					"tunnel_id", t.TunnelID,
-					"port", t.PublicPort,
-					"err", err,
-				)
 				proto.Write(ctrl, proto.Message{
 					Type:   proto.TypeError,
 					Reason: fmt.Sprintf("tunnel %s: %s", t.TunnelID, err.Error()),
@@ -168,7 +140,6 @@ func (s *Server) handleControl(ctrl net.Conn) {
 		}
 	}
 
-	// шаг 3 — регистрируем
 	s.mu.Lock()
 	for _, t := range msg.Tunnels {
 		s.tunnels[t.TunnelID] = ctrl
@@ -192,18 +163,15 @@ func (s *Server) handleControl(ctrl net.Conn) {
 		return
 	}
 
-	// поднимаем public listeners для TCP туннелей
 	for _, t := range msg.Tunnels {
 		if t.PublicPort != 0 {
 			go s.listenPublic(t.TunnelID, t.PublicPort, ctrl)
 		}
 	}
 
-	// держим control connection, ждём дисконнекта
 	buf := make([]byte, 1)
 	ctrl.Read(buf)
 
-	// cleanup
 	s.mu.Lock()
 	for _, t := range msg.Tunnels {
 		delete(s.tunnels, t.TunnelID)
@@ -213,10 +181,7 @@ func (s *Server) handleControl(ctrl net.Conn) {
 		if t.Host != "" {
 			delete(s.hosts, t.Host)
 		}
-		s.log.Infow("tunnel unregistered",
-			"remote", remote,
-			"tunnel_id", t.TunnelID,
-		)
+		s.log.Infow("tunnel unregistered", "remote", remote, "tunnel_id", t.TunnelID)
 	}
 	s.mu.Unlock()
 }
@@ -227,7 +192,6 @@ func (s *Server) listenData() {
 		s.log.Fatalw("data listen failed", "addr", s.cfg.DataAddr, "err", err)
 	}
 	s.log.Infow("data listening", "addr", s.cfg.DataAddr)
-
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -261,13 +225,9 @@ func (s *Server) handleData(dataConn net.Conn) {
 
 	s.log.Infow("bridging connection", "conn_id", msg.ConnID)
 
-	// отправляем буферизованные байты первыми
 	if len(pc.peeked) > 0 {
 		if _, err := dataConn.Write(pc.peeked); err != nil {
-			s.log.Errorw("write peeked bytes failed",
-				"conn_id", msg.ConnID,
-				"err", err,
-			)
+			s.log.Errorw("write peeked bytes failed", "conn_id", msg.ConnID, "err", err)
 			pc.conn.Close()
 			dataConn.Close()
 			return
@@ -285,7 +245,6 @@ func (s *Server) listenHTTP() {
 		return
 	}
 	s.log.Infow("http listening", "addr", s.cfg.HTTPAddr)
-
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -299,10 +258,7 @@ func (s *Server) listenHTTP() {
 func (s *Server) handleHTTP(conn net.Conn) {
 	result, err := httpparse.PeekHost(conn)
 	if err != nil {
-		s.log.Warnw("peek host failed",
-			"remote", conn.RemoteAddr(),
-			"err", err,
-		)
+		s.log.Warnw("peek host failed", "remote", conn.RemoteAddr(), "err", err)
 		conn.Close()
 		return
 	}
@@ -313,30 +269,86 @@ func (s *Server) handleHTTP(conn net.Conn) {
 	s.mu.Unlock()
 
 	if !ok || !ctrlOk {
-		s.log.Warnw("no tunnel for host",
-			"host", result.Host,
-			"remote", conn.RemoteAddr(),
-		)
+		s.log.Warnw("no tunnel for host", "host", result.Host, "remote", conn.RemoteAddr())
 		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"))
 		conn.Close()
 		return
 	}
 
+	s.sendConnect(conn, result.Peeked, tunnelID, ctrl)
+}
+
+func (s *Server) listenTLS() {
+	cert, err := tlscerts.LoadOrSelfSigned(
+		s.cfg.TLSCertFile,
+		s.cfg.TLSKeyFile,
+		s.cfg.TLSDomain,
+		"*."+s.cfg.TLSDomain,
+	)
+	if err != nil {
+		s.log.Errorw("load tls cert failed", "err", err)
+		return
+	}
+
+	tlsCfg := &tls.Config{Certificates: []tls.Certificate{cert}}
+	ln, err := tls.Listen("tcp", s.cfg.TLSAddr, tlsCfg)
+	if err != nil {
+		s.log.Errorw("tls listen failed", "addr", s.cfg.TLSAddr, "err", err)
+		return
+	}
+	s.log.Infow("tls listening", "addr", s.cfg.TLSAddr)
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			s.log.Errorw("tls accept failed", "err", err)
+			continue
+		}
+		go s.handleTLS(conn)
+	}
+}
+
+func (s *Server) handleTLS(conn net.Conn) {
+	tlsConn := conn.(*tls.Conn)
+	if err := tlsConn.Handshake(); err != nil {
+		s.log.Warnw("tls handshake failed", "remote", conn.RemoteAddr(), "err", err)
+		conn.Close()
+		return
+	}
+
+	host := tlsConn.ConnectionState().ServerName
+	if host == "" {
+		s.log.Warnw("no SNI in tls handshake", "remote", conn.RemoteAddr())
+		conn.Close()
+		return
+	}
+
+	s.mu.Lock()
+	tunnelID, ok := s.hosts[host]
+	ctrl, ctrlOk := s.tunnels[tunnelID]
+	s.mu.Unlock()
+
+	if !ok || !ctrlOk {
+		s.log.Warnw("no tunnel for tls host", "host", host, "remote", conn.RemoteAddr())
+		conn.Close()
+		return
+	}
+
+	s.log.Infow("new tls connection",
+		"host", host,
+		"tunnel_id", tunnelID,
+		"remote", conn.RemoteAddr(),
+	)
+
+	s.sendConnect(conn, nil, tunnelID, ctrl)
+}
+
+func (s *Server) sendConnect(conn net.Conn, peeked []byte, tunnelID string, ctrl net.Conn) {
 	connID := uuid.NewString()
 
 	s.mu.Lock()
-	s.pending[connID] = pendingConn{
-		conn:   conn,
-		peeked: result.Peeked,
-	}
+	s.pending[connID] = pendingConn{conn: conn, peeked: peeked}
 	s.mu.Unlock()
-
-	s.log.Infow("new http connection",
-		"host", result.Host,
-		"tunnel_id", tunnelID,
-		"conn_id", connID,
-		"remote", conn.RemoteAddr(),
-	)
 
 	if err := proto.Write(ctrl, proto.Message{
 		Type:     proto.TypeConnect,
@@ -359,11 +371,7 @@ func (s *Server) listenPublic(tunnelID string, port int, ctrl net.Conn) {
 	addr := fmt.Sprintf("0.0.0.0:%d", port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		s.log.Errorw("public listen failed",
-			"addr", addr,
-			"tunnel_id", tunnelID,
-			"err", err,
-		)
+		s.log.Errorw("public listen failed", "addr", addr, "tunnel_id", tunnelID, "err", err)
 		return
 	}
 	defer ln.Close()
@@ -392,11 +400,7 @@ func (s *Server) listenPublic(tunnelID string, port int, ctrl net.Conn) {
 			ConnID:   connID,
 			TunnelID: tunnelID,
 		}); err != nil {
-			s.log.Errorw("write connect failed",
-				"tunnel_id", tunnelID,
-				"conn_id", connID,
-				"err", err,
-			)
+			s.log.Errorw("write connect failed", "tunnel_id", tunnelID, "conn_id", connID, "err", err)
 			s.mu.Lock()
 			delete(s.pending, connID)
 			s.mu.Unlock()

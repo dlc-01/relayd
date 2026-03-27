@@ -22,7 +22,7 @@ func pipeWith(t *testing.T, data []byte) (net.Conn, net.Conn) {
 }
 
 func TestPeekHost_Simple(t *testing.T) {
-	server, client := pipeWith(t, makeHTTPRequest("app.giveoffer.solutions", "/"))
+	server, client := pipeWith(t, makeHTTPRequest("app.example.com", "/"))
 	defer server.Close()
 	defer client.Close()
 
@@ -30,8 +30,8 @@ func TestPeekHost_Simple(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PeekHost: %v", err)
 	}
-	if result.Host != "app.giveoffer.solutions" {
-		t.Errorf("host: got %q, want %q", result.Host, "app.giveoffer.solutions")
+	if result.Host != "app.example.com" {
+		t.Errorf("host: got %q, want %q", result.Host, "app.example.com")
 	}
 	if len(result.Peeked) == 0 {
 		t.Error("peeked should not be empty")
@@ -39,7 +39,7 @@ func TestPeekHost_Simple(t *testing.T) {
 }
 
 func TestPeekHost_WithPort(t *testing.T) {
-	server, client := pipeWith(t, makeHTTPRequest("app.giveoffer.solutions:8080", "/"))
+	server, client := pipeWith(t, makeHTTPRequest("app.example.com:8080", "/"))
 	defer server.Close()
 	defer client.Close()
 
@@ -47,13 +47,13 @@ func TestPeekHost_WithPort(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PeekHost: %v", err)
 	}
-	if result.Host != "app.giveoffer.solutions" {
-		t.Errorf("host: got %q, want %q", result.Host, "app.giveoffer.solutions")
+	if result.Host != "app.example.com" {
+		t.Errorf("host: got %q, want %q", result.Host, "app.example.com")
 	}
 }
 
 func TestPeekHost_PreservesBytes(t *testing.T) {
-	req := makeHTTPRequest("app.giveoffer.solutions", "/api/test")
+	req := makeHTTPRequest("app.example.com", "/api/test")
 	server, client := pipeWith(t, req)
 	defer server.Close()
 	defer client.Close()
@@ -63,7 +63,7 @@ func TestPeekHost_PreservesBytes(t *testing.T) {
 		t.Fatalf("PeekHost: %v", err)
 	}
 	if string(result.Peeked) != string(req) {
-		t.Errorf("peeked bytes do not match original request")
+		t.Error("peeked bytes do not match original request")
 	}
 }
 
@@ -96,17 +96,17 @@ func TestPeekHost_Timeout(t *testing.T) {
 			t.Error("expected timeout error")
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("test itself timed out")
+		t.Fatal("test timed out")
 	}
 }
 
 func TestExtractHost_CaseInsensitive(t *testing.T) {
-	req := []byte("GET / HTTP/1.1\r\nHOST: upper.giveoffer.solutions\r\n\r\n")
+	req := []byte("GET / HTTP/1.1\r\nHOST: upper.example.com\r\n\r\n")
 	host, err := extractHost(req)
 	if err != nil {
 		t.Fatalf("extractHost: %v", err)
 	}
-	if host != "upper.giveoffer.solutions" {
-		t.Errorf("got %q, want %q", host, "upper.giveoffer.solutions")
+	if host != "upper.example.com" {
+		t.Errorf("got %q, want %q", host, "upper.example.com")
 	}
 }

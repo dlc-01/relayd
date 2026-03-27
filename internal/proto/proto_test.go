@@ -11,8 +11,8 @@ func TestWriteRead_AllTypes(t *testing.T) {
 			Type: TypeRegister,
 			Tunnels: []TunnelDef{
 				{TunnelID: "web", PublicPort: 10001},
-				{TunnelID: "app", Host: "app.giveoffer.solutions"},
-				{TunnelID: "both", PublicPort: 10002, Host: "api.giveoffer.solutions"},
+				{TunnelID: "app", Host: "app.example.com"},
+				{TunnelID: "both", PublicPort: 10002, Host: "api.example.com"},
 			},
 		},
 		{Type: TypeOK},

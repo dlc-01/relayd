@@ -10,6 +10,10 @@ type ServerConfig struct {
 	ControlAddr   string
 	DataAddr      string
 	HTTPAddr      string
+	TLSAddr       string
+	TLSCertFile   string
+	TLSKeyFile    string
+	TLSDomain     string
 	MinPublicPort int
 	MaxPublicPort int
 	Dev           bool
@@ -34,6 +38,10 @@ func LoadServerConfig() ServerConfig {
 		ControlAddr:   getEnv("RELAYD_CONTROL_ADDR", "0.0.0.0:7000"),
 		DataAddr:      getEnv("RELAYD_DATA_ADDR", "0.0.0.0:7001"),
 		HTTPAddr:      getEnv("RELAYD_HTTP_ADDR", "0.0.0.0:80"),
+		TLSAddr:       getEnv("RELAYD_TLS_ADDR", "0.0.0.0:443"),
+		TLSCertFile:   getEnv("RELAYD_TLS_CERT", ""),
+		TLSKeyFile:    getEnv("RELAYD_TLS_KEY", ""),
+		TLSDomain:     getEnv("RELAYD_TLS_DOMAIN", "localhost"),
 		MinPublicPort: getEnvInt("RELAYD_MIN_PORT", 10000),
 		MaxPublicPort: getEnvInt("RELAYD_MAX_PORT", 60000),
 		Dev:           getEnv("RELAYD_DEV", "false") == "true",
@@ -65,9 +73,26 @@ func parseTunnel(entry string) (TunnelConfig, bool) {
 	tunnelID := parts[0]
 	rest := parts[1]
 
+	if strings.HasPrefix(rest, "https:") {
+		remainder := strings.TrimPrefix(rest, "https:")
+		idx := strings.Index(remainder, ":")
+		if idx < 0 {
+			return TunnelConfig{}, false
+		}
+		host := remainder[:idx]
+		localAddr := remainder[idx+1:]
+		if host == "" || localAddr == "" {
+			return TunnelConfig{}, false
+		}
+		return TunnelConfig{
+			TunnelID:  tunnelID,
+			Host:      host,
+			LocalAddr: localAddr,
+		}, true
+	}
+
 	if strings.HasPrefix(rest, "host:") {
 		remainder := strings.TrimPrefix(rest, "host:")
-		// remainder = app.giveoffer.solutions:127.0.0.1:8080
 		idx := strings.Index(remainder, ":")
 		if idx < 0 {
 			return TunnelConfig{}, false

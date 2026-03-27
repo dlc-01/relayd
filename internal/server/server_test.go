@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -42,6 +43,8 @@ func newTestServer(t *testing.T) *Server {
 		ControlAddr:   freeAddr(t),
 		DataAddr:      freeAddr(t),
 		HTTPAddr:      freeAddr(t),
+		TLSAddr:       freeAddr(t),
+		TLSDomain:     "example.com",
 		MinPublicPort: 1024,
 		MaxPublicPort: 65535,
 		Dev:           true,
@@ -50,6 +53,7 @@ func newTestServer(t *testing.T) *Server {
 	go s.listenControl()
 	go s.listenData()
 	go s.listenHTTP()
+	go s.listenTLS()
 	time.Sleep(50 * time.Millisecond)
 	return s
 }
@@ -131,10 +135,7 @@ func TestServer_Register_OK(t *testing.T) {
 	s := newTestServer(t)
 	port := freePort(t)
 
-	ctrl, err := net.Dial("tcp", s.cfg.ControlAddr)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ctrl, _ := net.Dial("tcp", s.cfg.ControlAddr)
 	defer ctrl.Close()
 
 	proto.Write(ctrl, proto.Message{
@@ -157,10 +158,7 @@ func TestServer_Register_NoTunnels(t *testing.T) {
 	ctrl, _ := net.Dial("tcp", s.cfg.ControlAddr)
 	defer ctrl.Close()
 
-	proto.Write(ctrl, proto.Message{
-		Type:    proto.TypeRegister,
-		Tunnels: []proto.TunnelDef{},
-	})
+	proto.Write(ctrl, proto.Message{Type: proto.TypeRegister, Tunnels: []proto.TunnelDef{}})
 
 	msg, _ := proto.Read(ctrl)
 	if msg.Type != proto.TypeError {
@@ -203,7 +201,7 @@ func TestServer_Register_HostConflict(t *testing.T) {
 	defer ctrl1.Close()
 	proto.Write(ctrl1, proto.Message{
 		Type:    proto.TypeRegister,
-		Tunnels: []proto.TunnelDef{{TunnelID: "app", Host: "app.giveoffer.solutions"}},
+		Tunnels: []proto.TunnelDef{{TunnelID: "app", Host: "app.example.com"}},
 	})
 	proto.Read(ctrl1)
 
@@ -211,7 +209,7 @@ func TestServer_Register_HostConflict(t *testing.T) {
 	defer ctrl2.Close()
 	proto.Write(ctrl2, proto.Message{
 		Type:    proto.TypeRegister,
-		Tunnels: []proto.TunnelDef{{TunnelID: "app2", Host: "app.giveoffer.solutions"}},
+		Tunnels: []proto.TunnelDef{{TunnelID: "app2", Host: "app.example.com"}},
 	})
 
 	msg, _ := proto.Read(ctrl2)
@@ -255,29 +253,62 @@ func TestServer_EndToEnd_TCP(t *testing.T) {
 
 func TestServer_EndToEnd_HTTP(t *testing.T) {
 	s := newTestServer(t)
-	httpAddr := startHTTPService(t, "hello from tunnel")
+	httpAddr := startHTTPService(t, "hello from http tunnel")
 
 	connectTestClient(t, s,
-		[]proto.TunnelDef{{TunnelID: "app", Host: "app.giveoffer.solutions"}},
+		[]proto.TunnelDef{{TunnelID: "app", Host: "app.example.com"}},
 		map[string]string{"app": httpAddr},
 	)
 	time.Sleep(100 * time.Millisecond)
 
-	req, err := http.NewRequest("GET", "http://"+s.cfg.HTTPAddr+"/", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Host = "app.giveoffer.solutions"
+	req, _ := http.NewRequest("GET", "http://"+s.cfg.HTTPAddr+"/", nil)
+	req.Host = "app.example.com"
 
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		t.Fatalf("http request: %v", err)
+		t.Fatalf("http: %v", err)
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "hello from tunnel") {
+	if !strings.Contains(string(body), "hello from http tunnel") {
+		t.Errorf("unexpected body: %s", body)
+	}
+}
+
+func TestServer_EndToEnd_HTTPS(t *testing.T) {
+	s := newTestServer(t)
+	httpAddr := startHTTPService(t, "hello from tls tunnel")
+
+	connectTestClient(t, s,
+		[]proto.TunnelDef{{TunnelID: "secure", Host: "secure.example.com"}},
+		map[string]string{"secure": httpAddr},
+	)
+	time.Sleep(100 * time.Millisecond)
+
+	tlsClient := &http.Client{
+		Timeout: 3 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			DialTLS: func(network, addr string) (net.Conn, error) {
+				return tls.Dial(network, s.cfg.TLSAddr, &tls.Config{
+					ServerName:         "secure.example.com",
+					InsecureSkipVerify: true,
+				})
+			},
+		},
+	}
+
+	req, _ := http.NewRequest("GET", "https://secure.example.com/", nil)
+	resp, err := tlsClient.Do(req)
+	if err != nil {
+		t.Fatalf("https: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "hello from tls tunnel") {
 		t.Errorf("unexpected body: %s", body)
 	}
 }
@@ -286,16 +317,13 @@ func TestServer_HTTP_NoTunnel_Returns502(t *testing.T) {
 	s := newTestServer(t)
 	time.Sleep(50 * time.Millisecond)
 
-	req, err := http.NewRequest("GET", "http://"+s.cfg.HTTPAddr+"/", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Host = "unknown.giveoffer.solutions"
+	req, _ := http.NewRequest("GET", "http://"+s.cfg.HTTPAddr+"/", nil)
+	req.Host = "unknown.example.com"
 
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		t.Fatalf("http request: %v", err)
+		t.Fatalf("http: %v", err)
 	}
 	defer resp.Body.Close()
 
@@ -316,10 +344,7 @@ func TestServer_EndToEnd_MultipleTunnels(t *testing.T) {
 			{TunnelID: "web", PublicPort: port1},
 			{TunnelID: "api", PublicPort: port2},
 		},
-		map[string]string{
-			"web": echo1,
-			"api": echo2,
-		},
+		map[string]string{"web": echo1, "api": echo2},
 	)
 	time.Sleep(100 * time.Millisecond)
 

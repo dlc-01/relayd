@@ -110,7 +110,7 @@ func TestClient_Register_SendsTunnels(t *testing.T) {
 
 	cfg := makeConfig(ctrlLn.Addr().String(), "127.0.0.1:1", []config.TunnelConfig{
 		{TunnelID: "web", PublicPort: 10001, LocalAddr: "127.0.0.1:8080"},
-		{TunnelID: "app", Host: "app.giveoffer.solutions", LocalAddr: "127.0.0.1:9000"},
+		{TunnelID: "app", Host: "app.example.com", LocalAddr: "127.0.0.1:9000"},
 	})
 	go New(cfg).Run()
 
@@ -125,7 +125,7 @@ func TestClient_Register_SendsTunnels(t *testing.T) {
 		if msg.Tunnels[0].TunnelID != "web" || msg.Tunnels[0].PublicPort != 10001 {
 			t.Errorf("tunnel[0]: %+v", msg.Tunnels[0])
 		}
-		if msg.Tunnels[1].TunnelID != "app" || msg.Tunnels[1].Host != "app.giveoffer.solutions" {
+		if msg.Tunnels[1].TunnelID != "app" || msg.Tunnels[1].Host != "app.example.com" {
 			t.Errorf("tunnel[1]: %+v", msg.Tunnels[1])
 		}
 	case <-time.After(time.Second):
@@ -147,7 +147,7 @@ func TestClient_HandleConnect_TCP(t *testing.T) {
 		defer dataConn.Close()
 		msg, err := proto.Read(dataConn)
 		if err != nil {
-			t.Fatalf("read data msg: %v", err)
+			t.Fatalf("read: %v", err)
 		}
 		if msg.Type != proto.TypeData {
 			t.Errorf("expected data, got %s", msg.Type)
@@ -165,7 +165,7 @@ func TestClient_HandleConnect_HTTP(t *testing.T) {
 	ctrlAddr, dataAddr, dataConnCh := startFakeServer(t, "app", "conn-2")
 
 	cfg := makeConfig(ctrlAddr, dataAddr, []config.TunnelConfig{
-		{TunnelID: "app", Host: "app.giveoffer.solutions", LocalAddr: echoAddr},
+		{TunnelID: "app", Host: "app.example.com", LocalAddr: echoAddr},
 	})
 	go New(cfg).Run()
 
@@ -174,7 +174,7 @@ func TestClient_HandleConnect_HTTP(t *testing.T) {
 		defer dataConn.Close()
 		msg, err := proto.Read(dataConn)
 		if err != nil {
-			t.Fatalf("read data msg: %v", err)
+			t.Fatalf("read: %v", err)
 		}
 		if msg.ConnID != "conn-2" {
 			t.Errorf("expected conn-2, got %s", msg.ConnID)
@@ -206,7 +206,7 @@ func TestClient_EndToEnd_Echo(t *testing.T) {
 		t.Fatalf("handshake: %v", err)
 	}
 
-	payload := "hello stage3"
+	payload := "hello stage4"
 	dataConn.Write([]byte(payload))
 
 	dataConn.SetReadDeadline(time.Now().Add(2 * time.Second))
@@ -232,6 +232,5 @@ func TestClient_UnknownTunnelID(t *testing.T) {
 		conn.Close()
 		t.Error("expected no data connection for unknown tunnel_id")
 	case <-time.After(500 * time.Millisecond):
-		// ок
 	}
 }
