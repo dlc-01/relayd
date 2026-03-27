@@ -27,11 +27,7 @@ func New(cfg config.ClientConfig) *Client {
 	for _, t := range cfg.Tunnels {
 		tunnels[t.TunnelID] = t.LocalAddr
 	}
-	return &Client{
-		cfg:     cfg,
-		log:     log,
-		tunnels: tunnels,
-	}
+	return &Client{cfg: cfg, log: log, tunnels: tunnels}
 }
 
 func (c *Client) Run() {
@@ -49,6 +45,7 @@ func (c *Client) Run() {
 		defs = append(defs, proto.TunnelDef{
 			TunnelID:   t.TunnelID,
 			PublicPort: t.PublicPort,
+			Host:       t.Host,
 		})
 	}
 
@@ -76,6 +73,7 @@ func (c *Client) Run() {
 			"tunnel_id", t.TunnelID,
 			"local_addr", t.LocalAddr,
 			"public_port", t.PublicPort,
+			"host", t.Host,
 		)
 	}
 
@@ -96,7 +94,10 @@ func (c *Client) Run() {
 func (c *Client) handleConnect(connID, tunnelID string) {
 	localAddr, ok := c.tunnels[tunnelID]
 	if !ok {
-		c.log.Warnw("unknown tunnel_id", "tunnel_id", tunnelID, "conn_id", connID)
+		c.log.Warnw("unknown tunnel_id",
+			"tunnel_id", tunnelID,
+			"conn_id", connID,
+		)
 		return
 	}
 
@@ -114,7 +115,6 @@ func (c *Client) handleConnect(connID, tunnelID string) {
 	dataConn, err := net.Dial("tcp", c.cfg.ServerDataAddr)
 	if err != nil {
 		c.log.Errorw("dial data failed",
-			"tunnel_id", tunnelID,
 			"conn_id", connID,
 			"err", err,
 		)
@@ -127,7 +127,6 @@ func (c *Client) handleConnect(connID, tunnelID string) {
 		ConnID: connID,
 	}); err != nil {
 		c.log.Errorw("send data msg failed",
-			"tunnel_id", tunnelID,
 			"conn_id", connID,
 			"err", err,
 		)

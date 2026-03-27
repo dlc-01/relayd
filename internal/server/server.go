@@ -7,18 +7,26 @@ import (
 	"sync"
 
 	"github.com/dlc-01/relayd/internal/config"
+	"github.com/dlc-01/relayd/internal/httpparse"
 	"github.com/dlc-01/relayd/internal/logger"
+	"github.com/dlc-01/relayd/internal/portcheck"
 	"github.com/dlc-01/relayd/internal/proto"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
 
+type pendingConn struct {
+	conn   net.Conn
+	peeked []byte
+}
+
 type Server struct {
 	cfg     config.ServerConfig
 	log     *zap.SugaredLogger
 	mu      sync.Mutex
-	pending map[string]net.Conn
+	pending map[string]pendingConn
 	ports   map[int]string
+	hosts   map[string]string
 	tunnels map[string]net.Conn
 }
 
@@ -32,8 +40,9 @@ func New(cfg config.ServerConfig) *Server {
 	return &Server{
 		cfg:     cfg,
 		log:     log,
-		pending: make(map[string]net.Conn),
+		pending: make(map[string]pendingConn),
 		ports:   make(map[int]string),
+		hosts:   make(map[string]string),
 		tunnels: make(map[string]net.Conn),
 	}
 }
@@ -41,16 +50,14 @@ func New(cfg config.ServerConfig) *Server {
 func (s *Server) Run() {
 	go s.listenControl()
 	go s.listenData()
+	go s.listenHTTP()
 	select {}
 }
 
 func (s *Server) listenControl() {
 	ln, err := net.Listen("tcp", s.cfg.ControlAddr)
 	if err != nil {
-		s.log.Fatalw("control listen failed",
-			"addr", s.cfg.ControlAddr,
-			"err", err,
-		)
+		s.log.Fatalw("control listen failed", "addr", s.cfg.ControlAddr, "err", err)
 	}
 	s.log.Infow("control listening", "addr", s.cfg.ControlAddr)
 
@@ -88,29 +95,94 @@ func (s *Server) handleControl(ctrl net.Conn) {
 		return
 	}
 
-	s.mu.Lock()
+	// базовая валидация
 	for _, t := range msg.Tunnels {
-		if existing, ok := s.ports[t.PublicPort]; ok {
-			s.mu.Unlock()
-			s.log.Warnw("port conflict",
-				"remote", remote,
-				"port", t.PublicPort,
-				"occupied_by", existing,
-			)
+		if t.TunnelID == "" {
 			proto.Write(ctrl, proto.Message{
 				Type:   proto.TypeError,
-				Reason: fmt.Sprintf("port %d already in use by tunnel %s", t.PublicPort, existing),
+				Reason: "tunnel_id cannot be empty",
+			})
+			return
+		}
+		if t.PublicPort == 0 && t.Host == "" {
+			proto.Write(ctrl, proto.Message{
+				Type:   proto.TypeError,
+				Reason: fmt.Sprintf("tunnel %s must have public_port or host", t.TunnelID),
 			})
 			return
 		}
 	}
+
+	// шаг 1 — проверяем конфликты в наших мапах
+	s.mu.Lock()
 	for _, t := range msg.Tunnels {
-		s.ports[t.PublicPort] = t.TunnelID
+		if t.PublicPort != 0 {
+			if existing, ok := s.ports[t.PublicPort]; ok {
+				s.mu.Unlock()
+				s.log.Warnw("port conflict",
+					"remote", remote,
+					"port", t.PublicPort,
+					"occupied_by", existing,
+				)
+				proto.Write(ctrl, proto.Message{
+					Type:   proto.TypeError,
+					Reason: fmt.Sprintf("port %d already in use by tunnel %s", t.PublicPort, existing),
+				})
+				return
+			}
+		}
+		if t.Host != "" {
+			if existing, ok := s.hosts[t.Host]; ok {
+				s.mu.Unlock()
+				s.log.Warnw("host conflict",
+					"remote", remote,
+					"host", t.Host,
+					"occupied_by", existing,
+				)
+				proto.Write(ctrl, proto.Message{
+					Type:   proto.TypeError,
+					Reason: fmt.Sprintf("host %s already in use by tunnel %s", t.Host, existing),
+				})
+				return
+			}
+		}
+	}
+	s.mu.Unlock()
+
+	// шаг 2 — проверяем системные порты через portcheck
+	for _, t := range msg.Tunnels {
+		if t.PublicPort != 0 {
+			if err := portcheck.Check(t.PublicPort, s.cfg.MinPublicPort, s.cfg.MaxPublicPort); err != nil {
+				s.log.Warnw("port check failed",
+					"remote", remote,
+					"tunnel_id", t.TunnelID,
+					"port", t.PublicPort,
+					"err", err,
+				)
+				proto.Write(ctrl, proto.Message{
+					Type:   proto.TypeError,
+					Reason: fmt.Sprintf("tunnel %s: %s", t.TunnelID, err.Error()),
+				})
+				return
+			}
+		}
+	}
+
+	// шаг 3 — регистрируем
+	s.mu.Lock()
+	for _, t := range msg.Tunnels {
 		s.tunnels[t.TunnelID] = ctrl
+		if t.PublicPort != 0 {
+			s.ports[t.PublicPort] = t.TunnelID
+		}
+		if t.Host != "" {
+			s.hosts[t.Host] = t.TunnelID
+		}
 		s.log.Infow("tunnel registered",
 			"remote", remote,
 			"tunnel_id", t.TunnelID,
 			"public_port", t.PublicPort,
+			"host", t.Host,
 		)
 	}
 	s.mu.Unlock()
@@ -120,21 +192,30 @@ func (s *Server) handleControl(ctrl net.Conn) {
 		return
 	}
 
+	// поднимаем public listeners для TCP туннелей
 	for _, t := range msg.Tunnels {
-		go s.listenPublic(t.TunnelID, t.PublicPort, ctrl)
+		if t.PublicPort != 0 {
+			go s.listenPublic(t.TunnelID, t.PublicPort, ctrl)
+		}
 	}
 
+	// держим control connection, ждём дисконнекта
 	buf := make([]byte, 1)
 	ctrl.Read(buf)
 
+	// cleanup
 	s.mu.Lock()
 	for _, t := range msg.Tunnels {
-		delete(s.ports, t.PublicPort)
 		delete(s.tunnels, t.TunnelID)
+		if t.PublicPort != 0 {
+			delete(s.ports, t.PublicPort)
+		}
+		if t.Host != "" {
+			delete(s.hosts, t.Host)
+		}
 		s.log.Infow("tunnel unregistered",
 			"remote", remote,
 			"tunnel_id", t.TunnelID,
-			"public_port", t.PublicPort,
 		)
 	}
 	s.mu.Unlock()
@@ -143,10 +224,7 @@ func (s *Server) handleControl(ctrl net.Conn) {
 func (s *Server) listenData() {
 	ln, err := net.Listen("tcp", s.cfg.DataAddr)
 	if err != nil {
-		s.log.Fatalw("data listen failed",
-			"addr", s.cfg.DataAddr,
-			"err", err,
-		)
+		s.log.Fatalw("data listen failed", "addr", s.cfg.DataAddr, "err", err)
 	}
 	s.log.Infow("data listening", "addr", s.cfg.DataAddr)
 
@@ -163,16 +241,13 @@ func (s *Server) listenData() {
 func (s *Server) handleData(dataConn net.Conn) {
 	msg, err := proto.Read(dataConn)
 	if err != nil || msg.Type != proto.TypeData {
-		s.log.Warnw("expected data msg",
-			"got", msg.Type,
-			"err", err,
-		)
+		s.log.Warnw("expected data msg", "got", msg.Type, "err", err)
 		dataConn.Close()
 		return
 	}
 
 	s.mu.Lock()
-	extConn, ok := s.pending[msg.ConnID]
+	pc, ok := s.pending[msg.ConnID]
 	if ok {
 		delete(s.pending, msg.ConnID)
 	}
@@ -184,11 +259,100 @@ func (s *Server) handleData(dataConn net.Conn) {
 		return
 	}
 
-	s.log.Infow("bridging connection",
-		"conn_id", msg.ConnID,
-	)
-	bridge(extConn, dataConn)
+	s.log.Infow("bridging connection", "conn_id", msg.ConnID)
+
+	// отправляем буферизованные байты первыми
+	if len(pc.peeked) > 0 {
+		if _, err := dataConn.Write(pc.peeked); err != nil {
+			s.log.Errorw("write peeked bytes failed",
+				"conn_id", msg.ConnID,
+				"err", err,
+			)
+			pc.conn.Close()
+			dataConn.Close()
+			return
+		}
+	}
+
+	bridge(pc.conn, dataConn)
 	s.log.Debugw("connection closed", "conn_id", msg.ConnID)
+}
+
+func (s *Server) listenHTTP() {
+	ln, err := net.Listen("tcp", s.cfg.HTTPAddr)
+	if err != nil {
+		s.log.Errorw("http listen failed", "addr", s.cfg.HTTPAddr, "err", err)
+		return
+	}
+	s.log.Infow("http listening", "addr", s.cfg.HTTPAddr)
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			s.log.Errorw("http accept failed", "err", err)
+			continue
+		}
+		go s.handleHTTP(conn)
+	}
+}
+
+func (s *Server) handleHTTP(conn net.Conn) {
+	result, err := httpparse.PeekHost(conn)
+	if err != nil {
+		s.log.Warnw("peek host failed",
+			"remote", conn.RemoteAddr(),
+			"err", err,
+		)
+		conn.Close()
+		return
+	}
+
+	s.mu.Lock()
+	tunnelID, ok := s.hosts[result.Host]
+	ctrl, ctrlOk := s.tunnels[tunnelID]
+	s.mu.Unlock()
+
+	if !ok || !ctrlOk {
+		s.log.Warnw("no tunnel for host",
+			"host", result.Host,
+			"remote", conn.RemoteAddr(),
+		)
+		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"))
+		conn.Close()
+		return
+	}
+
+	connID := uuid.NewString()
+
+	s.mu.Lock()
+	s.pending[connID] = pendingConn{
+		conn:   conn,
+		peeked: result.Peeked,
+	}
+	s.mu.Unlock()
+
+	s.log.Infow("new http connection",
+		"host", result.Host,
+		"tunnel_id", tunnelID,
+		"conn_id", connID,
+		"remote", conn.RemoteAddr(),
+	)
+
+	if err := proto.Write(ctrl, proto.Message{
+		Type:     proto.TypeConnect,
+		ConnID:   connID,
+		TunnelID: tunnelID,
+	}); err != nil {
+		s.log.Errorw("write connect failed",
+			"tunnel_id", tunnelID,
+			"conn_id", connID,
+			"err", err,
+		)
+		s.mu.Lock()
+		delete(s.pending, connID)
+		s.mu.Unlock()
+		conn.Close()
+	}
 }
 
 func (s *Server) listenPublic(tunnelID string, port int, ctrl net.Conn) {
@@ -203,24 +367,18 @@ func (s *Server) listenPublic(tunnelID string, port int, ctrl net.Conn) {
 		return
 	}
 	defer ln.Close()
-	s.log.Infow("public listening",
-		"addr", addr,
-		"tunnel_id", tunnelID,
-	)
+	s.log.Infow("public listening", "addr", addr, "tunnel_id", tunnelID)
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			s.log.Errorw("public accept failed",
-				"tunnel_id", tunnelID,
-				"err", err,
-			)
+			s.log.Errorw("public accept failed", "tunnel_id", tunnelID, "err", err)
 			return
 		}
-
 		connID := uuid.NewString()
+
 		s.mu.Lock()
-		s.pending[connID] = conn
+		s.pending[connID] = pendingConn{conn: conn}
 		s.mu.Unlock()
 
 		s.log.Infow("new external connection",

@@ -46,9 +46,8 @@ func checkProcNet(path string, port int) (bool, error) {
 	defer f.Close()
 
 	hexPort := fmt.Sprintf("%04X", port)
-
 	scanner := bufio.NewScanner(f)
-	scanner.Scan() // пропускаем заголовок
+	scanner.Scan()
 
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
@@ -57,7 +56,6 @@ func checkProcNet(path string, port int) (bool, error) {
 		}
 		localAddr := fields[1]
 		state := fields[3]
-
 		parts := strings.Split(localAddr, ":")
 		if len(parts) != 2 {
 			continue
@@ -66,7 +64,6 @@ func checkProcNet(path string, port int) (bool, error) {
 			return true, nil
 		}
 	}
-
 	return false, scanner.Err()
 }
 
