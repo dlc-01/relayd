@@ -333,18 +333,26 @@ func (s *Server) handleHTTP(conn net.Conn) {
 }
 
 func (s *Server) listenTLS() {
-	cert, err := tlscerts.LoadOrSelfSigned(
+	var extraDomains []struct{ Domain, CertFile, KeyFile string }
+	for _, d := range s.cfg.TLSDomains {
+		extraDomains = append(extraDomains, struct{ Domain, CertFile, KeyFile string }{
+			Domain:   d.Domain,
+			CertFile: d.CertFile,
+			KeyFile:  d.KeyFile,
+		})
+	}
+
+	tlsCfg, err := tlscerts.BuildTLSConfig(
 		s.cfg.TLSCertFile,
 		s.cfg.TLSKeyFile,
 		s.cfg.TLSDomain,
-		"*."+s.cfg.TLSDomain,
+		extraDomains,
 	)
 	if err != nil {
-		s.log.Errorw("load tls cert failed", "err", err)
+		s.log.Errorw("build tls config failed", "err", err)
 		return
 	}
 
-	tlsCfg := &tls.Config{Certificates: []tls.Certificate{cert}}
 	ln, err := tls.Listen("tcp", s.cfg.TLSAddr, tlsCfg)
 	if err != nil {
 		s.log.Errorw("tls listen failed", "addr", s.cfg.TLSAddr, "err", err)

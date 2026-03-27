@@ -106,6 +106,81 @@ func TestSelfSigned_SNI(t *testing.T) {
 	}
 }
 
+func TestBuildTLSConfig_DefaultCert(t *testing.T) {
+	tlsCfg, err := BuildTLSConfig("", "", "example.com", nil)
+	if err != nil {
+		t.Fatalf("BuildTLSConfig: %v", err)
+	}
+	if tlsCfg == nil {
+		t.Fatal("expected non-nil tls config")
+	}
+	if tlsCfg.GetCertificate == nil {
+		t.Fatal("expected GetCertificate to be set")
+	}
+}
+
+func TestBuildTLSConfig_SelectsCorrectCert(t *testing.T) {
+	cert1, err := SelfSigned("*.example.com", "example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert2, err := SelfSigned("*.other.com", "other.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ln1, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{cert1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln1.Close()
+
+	ln2, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{cert2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln2.Close()
+
+	for _, tc := range []struct {
+		ln         net.Listener
+		serverName string
+	}{
+		{ln1, "app.example.com"},
+		{ln2, "app.other.com"},
+	} {
+		tc := tc
+		t.Run(tc.serverName, func(t *testing.T) {
+			done := make(chan error, 1)
+			go func() {
+				conn, err := tc.ln.Accept()
+				if err != nil {
+					done <- err
+					return
+				}
+				defer conn.Close()
+				done <- conn.(*tls.Conn).Handshake()
+			}()
+
+			conn, err := tls.Dial("tcp", tc.ln.Addr().String(), &tls.Config{
+				ServerName:         tc.serverName,
+				InsecureSkipVerify: true,
+			})
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer conn.Close()
+
+			if err := <-done; err != nil {
+				t.Fatalf("handshake: %v", err)
+			}
+		})
+	}
+}
+
 func TestSelfSigned_MultipleConns(t *testing.T) {
 	cert, err := SelfSigned("*.example.com")
 	if err != nil {

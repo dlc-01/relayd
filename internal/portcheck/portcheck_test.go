@@ -57,10 +57,15 @@ func TestIsForbidden(t *testing.T) {
 		{80, true},
 		{443, true},
 		{22, true},
+		{25, true},
+		{53, true},
 		{1023, true},
 		{1024, false},
+		{3306, false},
+		{5432, false},
+		{6379, false},
+		{27017, false},
 		{10001, false},
-		{6379, true},
 	}
 
 	for _, tc := range cases {

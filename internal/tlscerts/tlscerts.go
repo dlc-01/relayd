@@ -57,3 +57,36 @@ func LoadOrSelfSigned(certFile, keyFile string, domains ...string) (tls.Certific
 	}
 	return SelfSigned(domains...)
 }
+
+func BuildTLSConfig(certFile, keyFile, domain string, extraDomains []struct{ Domain, CertFile, KeyFile string }) (*tls.Config, error) {
+	certMap := make(map[string]*tls.Certificate)
+
+	for _, d := range extraDomains {
+		cert, err := Load(d.CertFile, d.KeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("load cert for %s: %w", d.Domain, err)
+		}
+		c := cert
+		certMap[d.Domain] = &c
+	}
+
+	defaultCert, err := LoadOrSelfSigned(certFile, keyFile, domain, "*."+domain)
+	if err != nil {
+		return nil, fmt.Errorf("load default cert: %w", err)
+	}
+
+	return &tls.Config{
+		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			if cert, ok := certMap[hello.ServerName]; ok {
+				return cert, nil
+			}
+			if idx := len(hello.ServerName) - len(domain) - 1; idx > 0 {
+				parent := hello.ServerName[idx+1:]
+				if cert, ok := certMap[parent]; ok {
+					return cert, nil
+				}
+			}
+			return &defaultCert, nil
+		},
+	}, nil
+}

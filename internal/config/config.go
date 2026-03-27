@@ -14,6 +14,7 @@ type ServerConfig struct {
 	TLSCertFile   string
 	TLSKeyFile    string
 	TLSDomain     string
+	TLSDomains    []DomainCert
 	MinPublicPort int
 	MaxPublicPort int
 	Dev           bool
@@ -33,8 +34,14 @@ type ClientConfig struct {
 	Dev               bool
 }
 
+type DomainCert struct {
+	Domain   string
+	CertFile string
+	KeyFile  string
+}
+
 func LoadServerConfig() ServerConfig {
-	return ServerConfig{
+	cfg := ServerConfig{
 		ControlAddr:   getEnv("RELAYD_CONTROL_ADDR", "0.0.0.0:7000"),
 		DataAddr:      getEnv("RELAYD_DATA_ADDR", "0.0.0.0:7001"),
 		HTTPAddr:      getEnv("RELAYD_HTTP_ADDR", "0.0.0.0:80"),
@@ -46,6 +53,22 @@ func LoadServerConfig() ServerConfig {
 		MaxPublicPort: getEnvInt("RELAYD_MAX_PORT", 60000),
 		Dev:           getEnv("RELAYD_DEV", "false") == "true",
 	}
+
+	if raw := getEnv("RELAYD_TLS_DOMAINS", ""); raw != "" {
+		for _, entry := range strings.Split(raw, ",") {
+			parts := strings.SplitN(entry, ":", 3)
+			if len(parts) != 3 {
+				continue
+			}
+			cfg.TLSDomains = append(cfg.TLSDomains, DomainCert{
+				Domain:   parts[0],
+				CertFile: parts[1],
+				KeyFile:  parts[2],
+			})
+		}
+	}
+
+	return cfg
 }
 
 func LoadClientConfig() ClientConfig {
