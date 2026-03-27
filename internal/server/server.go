@@ -22,14 +22,22 @@ type pendingConn struct {
 	peeked []byte
 }
 
+type clientSession struct {
+	id        string
+	ctrl      net.Conn
+	tunnels   []proto.TunnelDef
+	listeners []net.Listener
+}
+
 type Server struct {
-	cfg     config.ServerConfig
-	log     *zap.SugaredLogger
-	mu      sync.Mutex
-	pending map[string]pendingConn
-	ports   map[int]string
-	hosts   map[string]string
-	tunnels map[string]net.Conn
+	cfg      config.ServerConfig
+	log      *zap.SugaredLogger
+	mu       sync.Mutex
+	pending  map[string]pendingConn
+	ports    map[int]string
+	hosts    map[string]string
+	tunnels  map[string]net.Conn
+	sessions map[string]*clientSession
 }
 
 func New(cfg config.ServerConfig) *Server {
@@ -40,12 +48,13 @@ func New(cfg config.ServerConfig) *Server {
 		log = logger.New("server")
 	}
 	return &Server{
-		cfg:     cfg,
-		log:     log,
-		pending: make(map[string]pendingConn),
-		ports:   make(map[int]string),
-		hosts:   make(map[string]string),
-		tunnels: make(map[string]net.Conn),
+		cfg:      cfg,
+		log:      log,
+		pending:  make(map[string]pendingConn),
+		ports:    make(map[int]string),
+		hosts:    make(map[string]string),
+		tunnels:  make(map[string]net.Conn),
+		sessions: make(map[string]*clientSession),
 	}
 }
 
@@ -105,6 +114,14 @@ func (s *Server) handleControl(ctrl net.Conn) {
 
 	s.mu.Lock()
 	for _, t := range msg.Tunnels {
+		if _, ok := s.tunnels[t.TunnelID]; ok {
+			s.mu.Unlock()
+			proto.Write(ctrl, proto.Message{
+				Type:   proto.TypeError,
+				Reason: fmt.Sprintf("tunnel_id %s already in use", t.TunnelID),
+			})
+			return
+		}
 		if t.PublicPort != 0 {
 			if existing, ok := s.ports[t.PublicPort]; ok {
 				s.mu.Unlock()
@@ -140,7 +157,14 @@ func (s *Server) handleControl(ctrl net.Conn) {
 		}
 	}
 
+	session := &clientSession{
+		id:      uuid.NewString(),
+		ctrl:    ctrl,
+		tunnels: msg.Tunnels,
+	}
+
 	s.mu.Lock()
+	s.sessions[session.id] = session
 	for _, t := range msg.Tunnels {
 		s.tunnels[t.TunnelID] = ctrl
 		if t.PublicPort != 0 {
@@ -151,6 +175,7 @@ func (s *Server) handleControl(ctrl net.Conn) {
 		}
 		s.log.Infow("tunnel registered",
 			"remote", remote,
+			"session_id", session.id,
 			"tunnel_id", t.TunnelID,
 			"public_port", t.PublicPort,
 			"host", t.Host,
@@ -160,20 +185,47 @@ func (s *Server) handleControl(ctrl net.Conn) {
 
 	if err := proto.Write(ctrl, proto.Message{Type: proto.TypeOK}); err != nil {
 		s.log.Errorw("write ok failed", "remote", remote, "err", err)
+		s.removeSession(session)
 		return
 	}
 
 	for _, t := range msg.Tunnels {
 		if t.PublicPort != 0 {
-			go s.listenPublic(t.TunnelID, t.PublicPort, ctrl)
+			if ln := s.listenPublic(t.TunnelID, t.PublicPort, ctrl); ln != nil {
+				s.mu.Lock()
+				session.listeners = append(session.listeners, ln)
+				s.mu.Unlock()
+			}
 		}
 	}
+
+	s.log.Infow("client connected",
+		"remote", remote,
+		"session_id", session.id,
+		"tunnels", len(msg.Tunnels),
+	)
 
 	buf := make([]byte, 1)
 	ctrl.Read(buf)
 
+	s.log.Infow("client disconnected",
+		"remote", remote,
+		"session_id", session.id,
+	)
+
+	s.removeSession(session)
+}
+
+func (s *Server) removeSession(session *clientSession) {
+	for _, ln := range session.listeners {
+		ln.Close()
+	}
+
 	s.mu.Lock()
-	for _, t := range msg.Tunnels {
+	defer s.mu.Unlock()
+
+	delete(s.sessions, session.id)
+	for _, t := range session.tunnels {
 		delete(s.tunnels, t.TunnelID)
 		if t.PublicPort != 0 {
 			delete(s.ports, t.PublicPort)
@@ -181,9 +233,11 @@ func (s *Server) handleControl(ctrl net.Conn) {
 		if t.Host != "" {
 			delete(s.hosts, t.Host)
 		}
-		s.log.Infow("tunnel unregistered", "remote", remote, "tunnel_id", t.TunnelID)
+		s.log.Infow("tunnel unregistered",
+			"session_id", session.id,
+			"tunnel_id", t.TunnelID,
+		)
 	}
-	s.mu.Unlock()
 }
 
 func (s *Server) listenData() {
@@ -367,46 +421,60 @@ func (s *Server) sendConnect(conn net.Conn, peeked []byte, tunnelID string, ctrl
 	}
 }
 
-func (s *Server) listenPublic(tunnelID string, port int, ctrl net.Conn) {
+func (s *Server) listenPublic(tunnelID string, port int, ctrl net.Conn) net.Listener {
 	addr := fmt.Sprintf("0.0.0.0:%d", port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		s.log.Errorw("public listen failed", "addr", addr, "tunnel_id", tunnelID, "err", err)
-		return
+		return nil
 	}
-	defer ln.Close()
 	s.log.Infow("public listening", "addr", addr, "tunnel_id", tunnelID)
 
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			s.log.Errorw("public accept failed", "tunnel_id", tunnelID, "err", err)
-			return
-		}
-		connID := uuid.NewString()
+	go func() {
+		defer ln.Close()
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				s.log.Debugw("public listener closed", "tunnel_id", tunnelID)
+				return
+			}
+			connID := uuid.NewString()
 
-		s.mu.Lock()
-		s.pending[connID] = pendingConn{conn: conn}
-		s.mu.Unlock()
-
-		s.log.Infow("new external connection",
-			"tunnel_id", tunnelID,
-			"conn_id", connID,
-			"remote", conn.RemoteAddr(),
-		)
-
-		if err := proto.Write(ctrl, proto.Message{
-			Type:     proto.TypeConnect,
-			ConnID:   connID,
-			TunnelID: tunnelID,
-		}); err != nil {
-			s.log.Errorw("write connect failed", "tunnel_id", tunnelID, "conn_id", connID, "err", err)
 			s.mu.Lock()
-			delete(s.pending, connID)
+			s.pending[connID] = pendingConn{conn: conn}
 			s.mu.Unlock()
-			conn.Close()
+
+			s.log.Infow("new external connection",
+				"tunnel_id", tunnelID,
+				"conn_id", connID,
+				"remote", conn.RemoteAddr(),
+			)
+
+			if err := proto.Write(ctrl, proto.Message{
+				Type:     proto.TypeConnect,
+				ConnID:   connID,
+				TunnelID: tunnelID,
+			}); err != nil {
+				s.log.Errorw("write connect failed",
+					"tunnel_id", tunnelID,
+					"conn_id", connID,
+					"err", err,
+				)
+				s.mu.Lock()
+				delete(s.pending, connID)
+				s.mu.Unlock()
+				conn.Close()
+			}
 		}
-	}
+	}()
+
+	return ln
+}
+
+func (s *Server) SessionCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.sessions)
 }
 
 func bridge(a, b net.Conn) {

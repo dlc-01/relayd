@@ -86,9 +86,11 @@ func startHTTPService(t *testing.T, response string) string {
 	return ts.Listener.Addr().String()
 }
 
-func connectTestClient(t *testing.T, s *Server, tunnels []proto.TunnelDef, localAddrs map[string]string) {
+func connectTestClient(t *testing.T, s *Server, tunnels []proto.TunnelDef, localAddrs map[string]string) chan struct{} {
 	t.Helper()
+	disconnected := make(chan struct{})
 	go func() {
+		defer close(disconnected)
 		ctrl, err := net.Dial("tcp", s.cfg.ControlAddr)
 		if err != nil {
 			return
@@ -129,6 +131,7 @@ func connectTestClient(t *testing.T, s *Server, tunnels []proto.TunnelDef, local
 			}(msg.ConnID, msg.TunnelID)
 		}
 	}()
+	return disconnected
 }
 
 func TestServer_Register_OK(t *testing.T) {
@@ -218,6 +221,145 @@ func TestServer_Register_HostConflict(t *testing.T) {
 	}
 	if !strings.Contains(msg.Reason, "already in use") {
 		t.Errorf("unexpected reason: %s", msg.Reason)
+	}
+}
+
+func TestServer_MultiClient_IndependentSessions(t *testing.T) {
+	s := newTestServer(t)
+	echo1 := startEchoService(t)
+	echo2 := startEchoService(t)
+	port1 := freePort(t)
+	port2 := freePort(t)
+
+	connectTestClient(t, s,
+		[]proto.TunnelDef{{TunnelID: "web", PublicPort: port1}},
+		map[string]string{"web": echo1},
+	)
+	connectTestClient(t, s,
+		[]proto.TunnelDef{{TunnelID: "api", PublicPort: port2}},
+		map[string]string{"api": echo2},
+	)
+	time.Sleep(100 * time.Millisecond)
+
+	if s.SessionCount() != 2 {
+		t.Errorf("expected 2 sessions, got %d", s.SessionCount())
+	}
+
+	for _, tc := range []struct {
+		port    int
+		payload string
+	}{
+		{port1, "hello from client A"},
+		{port2, "hello from client B"},
+	} {
+		tc := tc
+		t.Run(fmt.Sprintf("port_%d", tc.port), func(t *testing.T) {
+			conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", tc.port), time.Second)
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer conn.Close()
+
+			conn.Write([]byte(tc.payload))
+
+			conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			buf := make([]byte, len(tc.payload))
+			if _, err := io.ReadFull(conn, buf); err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			if string(buf) != tc.payload {
+				t.Errorf("got %q, want %q", buf, tc.payload)
+			}
+		})
+	}
+}
+
+func TestServer_MultiClient_DisconnectCleansOnlyOwnTunnels(t *testing.T) {
+	s := newTestServer(t)
+	echo1 := startEchoService(t)
+	echo2 := startEchoService(t)
+	port1 := freePort(t)
+	port2 := freePort(t)
+
+	ctrlA, _ := net.Dial("tcp", s.cfg.ControlAddr)
+	proto.Write(ctrlA, proto.Message{
+		Type:    proto.TypeRegister,
+		Tunnels: []proto.TunnelDef{{TunnelID: "web", PublicPort: port1}},
+	})
+	proto.Read(ctrlA)
+
+	connectTestClient(t, s,
+		[]proto.TunnelDef{{TunnelID: "api", PublicPort: port2}},
+		map[string]string{"api": echo2},
+	)
+	time.Sleep(100 * time.Millisecond)
+
+	if s.SessionCount() != 2 {
+		t.Fatalf("expected 2 sessions before disconnect, got %d", s.SessionCount())
+	}
+
+	ctrlA.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	if s.SessionCount() != 1 {
+		t.Errorf("expected 1 session after disconnect, got %d", s.SessionCount())
+	}
+
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port2), time.Second)
+	if err != nil {
+		t.Fatalf("client B tunnel should still work: %v", err)
+	}
+	defer conn.Close()
+
+	payload := "client B still alive"
+	conn.Write([]byte(payload))
+
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(buf) != payload {
+		t.Errorf("got %q, want %q", buf, payload)
+	}
+
+	ctrlC, _ := net.Dial("tcp", s.cfg.ControlAddr)
+	defer ctrlC.Close()
+	proto.Write(ctrlC, proto.Message{
+		Type:    proto.TypeRegister,
+		Tunnels: []proto.TunnelDef{{TunnelID: "web", PublicPort: port1}},
+	})
+	msg, _ := proto.Read(ctrlC)
+	if msg.Type != proto.TypeOK {
+		t.Errorf("expected ok after re-register freed port, got %s reason=%s", msg.Type, msg.Reason)
+	}
+
+	_ = echo1
+}
+
+func TestServer_MultiClient_SameTunnelIDDifferentClients(t *testing.T) {
+	s := newTestServer(t)
+	port1 := freePort(t)
+	port2 := freePort(t)
+
+	ctrl1, _ := net.Dial("tcp", s.cfg.ControlAddr)
+	defer ctrl1.Close()
+	proto.Write(ctrl1, proto.Message{
+		Type:    proto.TypeRegister,
+		Tunnels: []proto.TunnelDef{{TunnelID: "web", PublicPort: port1}},
+	})
+	proto.Read(ctrl1)
+
+	ctrl2, _ := net.Dial("tcp", s.cfg.ControlAddr)
+	defer ctrl2.Close()
+	proto.Write(ctrl2, proto.Message{
+		Type:    proto.TypeRegister,
+		Tunnels: []proto.TunnelDef{{TunnelID: "web", PublicPort: port2}},
+	})
+
+	msg, _ := proto.Read(ctrl2)
+	if msg.Type != proto.TypeError {
+		t.Errorf("expected error for duplicate tunnel_id, got %s", msg.Type)
 	}
 }
 
@@ -329,50 +471,5 @@ func TestServer_HTTP_NoTunnel_Returns502(t *testing.T) {
 
 	if resp.StatusCode != 502 {
 		t.Errorf("expected 502, got %d", resp.StatusCode)
-	}
-}
-
-func TestServer_EndToEnd_MultipleTunnels(t *testing.T) {
-	s := newTestServer(t)
-	echo1 := startEchoService(t)
-	echo2 := startEchoService(t)
-	port1 := freePort(t)
-	port2 := freePort(t)
-
-	connectTestClient(t, s,
-		[]proto.TunnelDef{
-			{TunnelID: "web", PublicPort: port1},
-			{TunnelID: "api", PublicPort: port2},
-		},
-		map[string]string{"web": echo1, "api": echo2},
-	)
-	time.Sleep(100 * time.Millisecond)
-
-	for _, tc := range []struct {
-		port    int
-		payload string
-	}{
-		{port1, "hello web"},
-		{port2, "hello api"},
-	} {
-		tc := tc
-		t.Run(fmt.Sprintf("port_%d", tc.port), func(t *testing.T) {
-			conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", tc.port), time.Second)
-			if err != nil {
-				t.Fatalf("dial: %v", err)
-			}
-			defer conn.Close()
-
-			conn.Write([]byte(tc.payload))
-
-			conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-			buf := make([]byte, len(tc.payload))
-			if _, err := io.ReadFull(conn, buf); err != nil {
-				t.Fatalf("read: %v", err)
-			}
-			if string(buf) != tc.payload {
-				t.Errorf("got %q, want %q", buf, tc.payload)
-			}
-		})
 	}
 }
