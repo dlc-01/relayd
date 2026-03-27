@@ -473,3 +473,106 @@ func TestServer_HTTP_NoTunnel_Returns502(t *testing.T) {
 		t.Errorf("expected 502, got %d", resp.StatusCode)
 	}
 }
+
+func TestServer_MultiHost_Aliases(t *testing.T) {
+	s := newTestServer(t)
+	httpAddr := startHTTPService(t, "hello from aliased tunnel")
+
+	connectTestClient(t, s,
+		[]proto.TunnelDef{{
+			TunnelID: "app",
+			Host:     "app.example.com",
+			Hosts:    []string{"alias.example.com", "other.example.com"},
+		}},
+		map[string]string{"app": httpAddr},
+	)
+	time.Sleep(100 * time.Millisecond)
+
+	for _, host := range []string{"app.example.com", "alias.example.com", "other.example.com"} {
+		host := host
+		t.Run(host, func(t *testing.T) {
+			req, _ := http.NewRequest("GET", "http://"+s.cfg.HTTPAddr+"/", nil)
+			req.Host = host
+
+			client := &http.Client{Timeout: 3 * time.Second}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("http: %v", err)
+			}
+			defer resp.Body.Close()
+
+			body, _ := io.ReadAll(resp.Body)
+			if !strings.Contains(string(body), "hello from aliased tunnel") {
+				t.Errorf("host %s: unexpected body: %s", host, body)
+			}
+		})
+	}
+}
+
+func TestServer_AliasConflict(t *testing.T) {
+	s := newTestServer(t)
+
+	ctrl1, _ := net.Dial("tcp", s.cfg.ControlAddr)
+	defer ctrl1.Close()
+	proto.Write(ctrl1, proto.Message{
+		Type: proto.TypeRegister,
+		Tunnels: []proto.TunnelDef{{
+			TunnelID: "app",
+			Host:     "app.example.com",
+			Hosts:    []string{"alias.example.com"},
+		}},
+	})
+	proto.Read(ctrl1)
+
+	ctrl2, _ := net.Dial("tcp", s.cfg.ControlAddr)
+	defer ctrl2.Close()
+	proto.Write(ctrl2, proto.Message{
+		Type: proto.TypeRegister,
+		Tunnels: []proto.TunnelDef{{
+			TunnelID: "app2",
+			Host:     "alias.example.com",
+		}},
+	})
+
+	msg, _ := proto.Read(ctrl2)
+	if msg.Type != proto.TypeError {
+		t.Errorf("expected error for alias conflict, got %s", msg.Type)
+	}
+	if !strings.Contains(msg.Reason, "already in use") {
+		t.Errorf("unexpected reason: %s", msg.Reason)
+	}
+}
+
+func TestServer_AliasCleanupOnDisconnect(t *testing.T) {
+	s := newTestServer(t)
+
+	ctrl, _ := net.Dial("tcp", s.cfg.ControlAddr)
+	proto.Write(ctrl, proto.Message{
+		Type: proto.TypeRegister,
+		Tunnels: []proto.TunnelDef{{
+			TunnelID: "app",
+			Host:     "app.example.com",
+			Hosts:    []string{"alias.example.com"},
+		}},
+	})
+	proto.Read(ctrl)
+	time.Sleep(50 * time.Millisecond)
+
+	ctrl.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	ctrl2, _ := net.Dial("tcp", s.cfg.ControlAddr)
+	defer ctrl2.Close()
+	proto.Write(ctrl2, proto.Message{
+		Type: proto.TypeRegister,
+		Tunnels: []proto.TunnelDef{{
+			TunnelID: "app",
+			Host:     "alias.example.com",
+		}},
+	})
+
+	msg, _ := proto.Read(ctrl2)
+	if msg.Type != proto.TypeOK {
+		t.Errorf("expected ok after alias freed, got %s reason=%s", msg.Type, msg.Reason)
+	}
+}

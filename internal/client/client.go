@@ -46,6 +46,7 @@ func (c *Client) Run() {
 			TunnelID:   t.TunnelID,
 			PublicPort: t.PublicPort,
 			Host:       t.Host,
+			Hosts:      t.Hosts,
 		})
 	}
 
@@ -74,6 +75,7 @@ func (c *Client) Run() {
 			"local_addr", t.LocalAddr,
 			"public_port", t.PublicPort,
 			"host", t.Host,
+			"aliases", t.Hosts,
 		)
 	}
 

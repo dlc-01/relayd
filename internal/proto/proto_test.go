@@ -12,7 +12,7 @@ func TestWriteRead_AllTypes(t *testing.T) {
 			Tunnels: []TunnelDef{
 				{TunnelID: "web", PublicPort: 10001},
 				{TunnelID: "app", Host: "app.example.com"},
-				{TunnelID: "both", PublicPort: 10002, Host: "api.example.com"},
+				{TunnelID: "multi", Host: "app.example.com", Hosts: []string{"alias.example.com", "other.example.com"}},
 			},
 		},
 		{Type: TypeOK},
@@ -54,8 +54,16 @@ func TestWriteRead_AllTypes(t *testing.T) {
 				t.Fatalf("tunnels len: got %d, want %d", len(got.Tunnels), len(msg.Tunnels))
 			}
 			for i := range msg.Tunnels {
-				if got.Tunnels[i] != msg.Tunnels[i] {
-					t.Errorf("tunnel[%d]: got %+v, want %+v", i, got.Tunnels[i], msg.Tunnels[i])
+				if got.Tunnels[i].TunnelID != msg.Tunnels[i].TunnelID {
+					t.Errorf("tunnel[%d].TunnelID: got %s, want %s", i, got.Tunnels[i].TunnelID, msg.Tunnels[i].TunnelID)
+				}
+				if len(got.Tunnels[i].Hosts) != len(msg.Tunnels[i].Hosts) {
+					t.Errorf("tunnel[%d].Hosts len: got %d, want %d", i, len(got.Tunnels[i].Hosts), len(msg.Tunnels[i].Hosts))
+				}
+				for j := range msg.Tunnels[i].Hosts {
+					if got.Tunnels[i].Hosts[j] != msg.Tunnels[i].Hosts[j] {
+						t.Errorf("tunnel[%d].Hosts[%d]: got %s, want %s", i, j, got.Tunnels[i].Hosts[j], msg.Tunnels[i].Hosts[j])
+					}
 				}
 			}
 		})

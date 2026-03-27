@@ -25,6 +25,7 @@ type TunnelConfig struct {
 	PublicPort int
 	LocalAddr  string
 	Host       string
+	Hosts      []string
 }
 
 type ClientConfig struct {
@@ -98,38 +99,12 @@ func parseTunnel(entry string) (TunnelConfig, bool) {
 
 	if strings.HasPrefix(rest, "https:") {
 		remainder := strings.TrimPrefix(rest, "https:")
-		idx := strings.Index(remainder, ":")
-		if idx < 0 {
-			return TunnelConfig{}, false
-		}
-		host := remainder[:idx]
-		localAddr := remainder[idx+1:]
-		if host == "" || localAddr == "" {
-			return TunnelConfig{}, false
-		}
-		return TunnelConfig{
-			TunnelID:  tunnelID,
-			Host:      host,
-			LocalAddr: localAddr,
-		}, true
+		return parseHostTunnel(tunnelID, remainder)
 	}
 
 	if strings.HasPrefix(rest, "host:") {
 		remainder := strings.TrimPrefix(rest, "host:")
-		idx := strings.Index(remainder, ":")
-		if idx < 0 {
-			return TunnelConfig{}, false
-		}
-		host := remainder[:idx]
-		localAddr := remainder[idx+1:]
-		if host == "" || localAddr == "" {
-			return TunnelConfig{}, false
-		}
-		return TunnelConfig{
-			TunnelID:  tunnelID,
-			Host:      host,
-			LocalAddr: localAddr,
-		}, true
+		return parseHostTunnel(tunnelID, remainder)
 	}
 
 	portAndAddr := strings.SplitN(rest, ":", 3)
@@ -145,6 +120,40 @@ func parseTunnel(entry string) (TunnelConfig, bool) {
 		PublicPort: port,
 		LocalAddr:  portAndAddr[1] + ":" + portAndAddr[2],
 	}, true
+}
+
+func parseHostTunnel(tunnelID, remainder string) (TunnelConfig, bool) {
+	lastColon := strings.LastIndex(remainder, ":")
+	if lastColon < 0 {
+		return TunnelConfig{}, false
+	}
+	port := remainder[lastColon+1:]
+	beforePort := remainder[:lastColon]
+
+	secondLastColon := strings.LastIndex(beforePort, ":")
+	if secondLastColon < 0 {
+		return TunnelConfig{}, false
+	}
+	ip := beforePort[secondLastColon+1:]
+	hostsStr := beforePort[:secondLastColon]
+
+	if hostsStr == "" || ip == "" || port == "" {
+		return TunnelConfig{}, false
+	}
+
+	localAddr := ip + ":" + port
+	hostParts := strings.Split(hostsStr, "|")
+
+	tc := TunnelConfig{
+		TunnelID:  tunnelID,
+		LocalAddr: localAddr,
+		Host:      hostParts[0],
+	}
+	if len(hostParts) > 1 {
+		tc.Hosts = hostParts[1:]
+	}
+
+	return tc, true
 }
 
 func getEnv(key, fallback string) string {

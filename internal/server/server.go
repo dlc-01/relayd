@@ -103,7 +103,7 @@ func (s *Server) handleControl(ctrl net.Conn) {
 			proto.Write(ctrl, proto.Message{Type: proto.TypeError, Reason: "tunnel_id cannot be empty"})
 			return
 		}
-		if t.PublicPort == 0 && t.Host == "" {
+		if t.PublicPort == 0 && t.Host == "" && len(t.Hosts) == 0 {
 			proto.Write(ctrl, proto.Message{
 				Type:   proto.TypeError,
 				Reason: fmt.Sprintf("tunnel %s must have public_port or host", t.TunnelID),
@@ -142,6 +142,16 @@ func (s *Server) handleControl(ctrl net.Conn) {
 				return
 			}
 		}
+		for _, h := range t.Hosts {
+			if existing, ok := s.hosts[h]; ok {
+				s.mu.Unlock()
+				proto.Write(ctrl, proto.Message{
+					Type:   proto.TypeError,
+					Reason: fmt.Sprintf("host %s already in use by tunnel %s", h, existing),
+				})
+				return
+			}
+		}
 	}
 	s.mu.Unlock()
 
@@ -173,12 +183,16 @@ func (s *Server) handleControl(ctrl net.Conn) {
 		if t.Host != "" {
 			s.hosts[t.Host] = t.TunnelID
 		}
+		for _, h := range t.Hosts {
+			s.hosts[h] = t.TunnelID
+		}
 		s.log.Infow("tunnel registered",
 			"remote", remote,
 			"session_id", session.id,
 			"tunnel_id", t.TunnelID,
 			"public_port", t.PublicPort,
 			"host", t.Host,
+			"aliases", t.Hosts,
 		)
 	}
 	s.mu.Unlock()
@@ -232,6 +246,9 @@ func (s *Server) removeSession(session *clientSession) {
 		}
 		if t.Host != "" {
 			delete(s.hosts, t.Host)
+		}
+		for _, h := range t.Hosts {
+			delete(s.hosts, h)
 		}
 		s.log.Infow("tunnel unregistered",
 			"session_id", session.id,

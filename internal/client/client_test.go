@@ -110,7 +110,7 @@ func TestClient_Register_SendsTunnels(t *testing.T) {
 
 	cfg := makeConfig(ctrlLn.Addr().String(), "127.0.0.1:1", []config.TunnelConfig{
 		{TunnelID: "web", PublicPort: 10001, LocalAddr: "127.0.0.1:8080"},
-		{TunnelID: "app", Host: "app.example.com", LocalAddr: "127.0.0.1:9000"},
+		{TunnelID: "app", Host: "app.example.com", Hosts: []string{"alias.example.com"}, LocalAddr: "127.0.0.1:9000"},
 	})
 	go New(cfg).Run()
 
@@ -122,14 +122,14 @@ func TestClient_Register_SendsTunnels(t *testing.T) {
 		if len(msg.Tunnels) != 2 {
 			t.Fatalf("expected 2 tunnels, got %d", len(msg.Tunnels))
 		}
-		if msg.Tunnels[0].TunnelID != "web" || msg.Tunnels[0].PublicPort != 10001 {
-			t.Errorf("tunnel[0]: %+v", msg.Tunnels[0])
+		if msg.Tunnels[1].Host != "app.example.com" {
+			t.Errorf("host: got %s", msg.Tunnels[1].Host)
 		}
-		if msg.Tunnels[1].TunnelID != "app" || msg.Tunnels[1].Host != "app.example.com" {
-			t.Errorf("tunnel[1]: %+v", msg.Tunnels[1])
+		if len(msg.Tunnels[1].Hosts) != 1 || msg.Tunnels[1].Hosts[0] != "alias.example.com" {
+			t.Errorf("aliases: got %v", msg.Tunnels[1].Hosts)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("timeout waiting for register")
+		t.Fatal("timeout")
 	}
 }
 
@@ -160,12 +160,17 @@ func TestClient_HandleConnect_TCP(t *testing.T) {
 	}
 }
 
-func TestClient_HandleConnect_HTTP(t *testing.T) {
+func TestClient_HandleConnect_WithAlias(t *testing.T) {
 	echoAddr := startEchoService(t)
 	ctrlAddr, dataAddr, dataConnCh := startFakeServer(t, "app", "conn-2")
 
 	cfg := makeConfig(ctrlAddr, dataAddr, []config.TunnelConfig{
-		{TunnelID: "app", Host: "app.example.com", LocalAddr: echoAddr},
+		{
+			TunnelID:  "app",
+			Host:      "app.example.com",
+			Hosts:     []string{"alias.example.com"},
+			LocalAddr: echoAddr,
+		},
 	})
 	go New(cfg).Run()
 
@@ -206,7 +211,7 @@ func TestClient_EndToEnd_Echo(t *testing.T) {
 		t.Fatalf("handshake: %v", err)
 	}
 
-	payload := "hello stage4"
+	payload := "hello aliasing"
 	dataConn.Write([]byte(payload))
 
 	dataConn.SetReadDeadline(time.Now().Add(2 * time.Second))

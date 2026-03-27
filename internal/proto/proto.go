@@ -17,9 +17,10 @@ const (
 )
 
 type TunnelDef struct {
-	TunnelID   string `json:"tunnel_id"`
-	PublicPort int    `json:"public_port,omitempty"`
-	Host       string `json:"host,omitempty"`
+	TunnelID   string   `json:"tunnel_id"`
+	PublicPort int      `json:"public_port,omitempty"`
+	Host       string   `json:"host,omitempty"`
+	Hosts      []string `json:"hosts,omitempty"`
 }
 
 type Message struct {
