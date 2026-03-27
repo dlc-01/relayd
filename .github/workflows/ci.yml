@@ -82,8 +82,44 @@ jobs:
             relayd-server \
             ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/opt/relayd/relayd-server
 
-      - name: Restart service
+      - name: Update systemd and restart
         run: |
-          ssh -i ~/.ssh/deploy_key \
-            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
-            "chmod +x /opt/relayd/relayd-server && systemctl restart relayd-server && systemctl status relayd-server"
+          ssh -i ~/.ssh/deploy_key ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} bash << 'EOF'
+            chmod +x /opt/relayd/relayd-server
+
+            cat > /etc/systemd/system/relayd-server.service << 'UNIT'
+          [Unit]
+          Description=Relayd Server
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=root
+          WorkingDirectory=/opt/relayd
+          ExecStart=/opt/relayd/relayd-server
+          Restart=on-failure
+          RestartSec=5s
+
+          Environment=RELAYD_CONTROL_ADDR=0.0.0.0:7000
+          Environment=RELAYD_DATA_ADDR=0.0.0.0:7001
+          Environment=RELAYD_HTTP_ADDR=0.0.0.0:80
+          Environment=RELAYD_TLS_ADDR=0.0.0.0:443
+          Environment=RELAYD_TLS_CERT=/etc/letsencrypt/live/${{ secrets.TLS_DOMAIN }}/fullchain.pem
+          Environment=RELAYD_TLS_KEY=/etc/letsencrypt/live/${{ secrets.TLS_DOMAIN }}/privkey.pem
+          Environment=RELAYD_TLS_DOMAIN=${{ secrets.TLS_DOMAIN }}
+          Environment=RELAYD_MIN_PORT=10000
+          Environment=RELAYD_MAX_PORT=60000
+
+          StandardOutput=journal
+          StandardError=journal
+          SyslogIdentifier=relayd-server
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+
+            systemctl daemon-reload
+            systemctl enable relayd-server
+            systemctl restart relayd-server
+            systemctl status relayd-server
+          EOF
