@@ -1,6 +1,9 @@
 package client
 
 import (
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -8,6 +11,7 @@ import (
 
 	"github.com/dlc-01/relayd/internal/config"
 	"github.com/dlc-01/relayd/internal/logger"
+	"github.com/dlc-01/relayd/internal/pin"
 	"github.com/dlc-01/relayd/internal/proto"
 	"go.uber.org/zap"
 )
@@ -62,11 +66,25 @@ func (c *Client) Run() {
 }
 
 func (c *Client) connect() error {
-	ctrl, err := net.DialTimeout("tcp", c.cfg.ServerControlAddr, 10*time.Second)
+	tlsCfg, err := c.buildTLSConfig()
+	if err != nil {
+		return fmt.Errorf("build tls config: %w", err)
+	}
+
+	ctrl, err := tls.DialWithDialer(
+		&net.Dialer{Timeout: c.heartbeatTimeout},
+		"tcp",
+		c.cfg.ServerControlAddr,
+		tlsCfg,
+	)
 	if err != nil {
 		return err
 	}
 	defer ctrl.Close()
+
+	if err := c.verifyAndPin(ctrl); err != nil {
+		return fmt.Errorf("pin verification failed: %w", err)
+	}
 
 	var defs []proto.TunnelDef
 	for _, t := range c.cfg.Tunnels {
@@ -127,6 +145,45 @@ func (c *Client) connect() error {
 	}
 }
 
+func (c *Client) buildTLSConfig() (*tls.Config, error) {
+	return &tls.Config{
+		InsecureSkipVerify: true,
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			return nil
+		},
+	}, nil
+}
+
+func (c *Client) verifyAndPin(conn *tls.Conn) error {
+	state := conn.ConnectionState()
+	if len(state.PeerCertificates) == 0 {
+		return fmt.Errorf("no peer certificates")
+	}
+
+	sum := sha256.Sum256(state.PeerCertificates[0].Raw)
+	fp := hex.EncodeToString(sum[:])
+
+	if !pin.Exists(c.cfg.PinFile) {
+		c.log.Infow("pinning server certificate", "fingerprint", fp)
+		if err := pin.Save(c.cfg.PinFile, fp); err != nil {
+			return fmt.Errorf("save pin: %w", err)
+		}
+		return nil
+	}
+
+	saved, err := pin.Load(c.cfg.PinFile)
+	if err != nil {
+		return fmt.Errorf("load pin: %w", err)
+	}
+
+	if fp != saved {
+		return fmt.Errorf("certificate fingerprint mismatch: got %s, want %s (possible MITM)", fp, saved)
+	}
+
+	c.log.Debugw("certificate pin verified", "fingerprint", fp)
+	return nil
+}
+
 func (c *Client) heartbeat(ctrl net.Conn, done chan struct{}) {
 	ticker := time.NewTicker(c.heartbeatInterval)
 	defer ticker.Stop()
@@ -169,7 +226,13 @@ func (c *Client) handleConnect(connID, tunnelID string) {
 		return
 	}
 
-	dataConn, err := net.Dial("tcp", c.cfg.ServerDataAddr)
+	tlsCfg := &tls.Config{InsecureSkipVerify: true}
+	dataConn, err := tls.DialWithDialer(
+		&net.Dialer{Timeout: c.heartbeatTimeout},
+		"tcp",
+		c.cfg.ServerDataAddr,
+		tlsCfg,
+	)
 	if err != nil {
 		c.log.Errorw("dial data failed",
 			"conn_id", connID,
@@ -203,7 +266,6 @@ func (c *Client) handleConnect(connID, tunnelID string) {
 		"tunnel_id", tunnelID,
 	)
 }
-
 func bridge(a, b net.Conn) {
 	defer a.Close()
 	defer b.Close()

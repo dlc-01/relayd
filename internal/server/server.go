@@ -68,11 +68,24 @@ func (s *Server) Run() {
 }
 
 func (s *Server) listenControl() {
-	ln, err := net.Listen("tcp", s.cfg.ControlAddr)
+	cert, err := tlscerts.LoadOrGenerate(s.cfg.ControlCertFile, s.cfg.ControlKeyFile)
+	if err != nil {
+		s.log.Fatalw("load control cert failed", "err", err)
+	}
+
+	fp, err := tlscerts.Fingerprint(cert)
+	if err != nil {
+		s.log.Fatalw("fingerprint failed", "err", err)
+	}
+	s.log.Infow("control tls ready", "fingerprint", fp)
+
+	tlsCfg := &tls.Config{Certificates: []tls.Certificate{cert}}
+	ln, err := tls.Listen("tcp", s.cfg.ControlAddr, tlsCfg)
 	if err != nil {
 		s.log.Fatalw("control listen failed", "addr", s.cfg.ControlAddr, "err", err)
 	}
 	s.log.Infow("control listening", "addr", s.cfg.ControlAddr)
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -279,11 +292,18 @@ func (s *Server) removeSession(session *clientSession) {
 }
 
 func (s *Server) listenData() {
-	ln, err := net.Listen("tcp", s.cfg.DataAddr)
+	cert, err := tlscerts.LoadOrGenerate(s.cfg.ControlCertFile, s.cfg.ControlKeyFile)
+	if err != nil {
+		s.log.Fatalw("load data cert failed", "err", err)
+	}
+
+	tlsCfg := &tls.Config{Certificates: []tls.Certificate{cert}}
+	ln, err := tls.Listen("tcp", s.cfg.DataAddr, tlsCfg)
 	if err != nil {
 		s.log.Fatalw("data listen failed", "addr", s.cfg.DataAddr, "err", err)
 	}
 	s.log.Infow("data listening", "addr", s.cfg.DataAddr)
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {

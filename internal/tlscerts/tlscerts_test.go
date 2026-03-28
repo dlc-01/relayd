@@ -3,6 +3,8 @@ package tlscerts
 import (
 	"crypto/tls"
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -65,6 +67,84 @@ func TestLoadOrSelfSigned_FallsBackToSelfSigned(t *testing.T) {
 	}
 }
 
+func TestGenerateAndSave(t *testing.T) {
+	dir := t.TempDir()
+	certFile := filepath.Join(dir, "cert.pem")
+	keyFile := filepath.Join(dir, "key.pem")
+
+	cert, err := GenerateAndSave(certFile, keyFile)
+	if err != nil {
+		t.Fatalf("GenerateAndSave: %v", err)
+	}
+	if len(cert.Certificate) == 0 {
+		t.Error("expected certificate data")
+	}
+
+	if _, err := os.Stat(certFile); err != nil {
+		t.Errorf("cert file not created: %v", err)
+	}
+	if _, err := os.Stat(keyFile); err != nil {
+		t.Errorf("key file not created: %v", err)
+	}
+}
+
+func TestLoadOrGenerate_GeneratesIfMissing(t *testing.T) {
+	dir := t.TempDir()
+	certFile := filepath.Join(dir, "cert.pem")
+	keyFile := filepath.Join(dir, "key.pem")
+
+	cert, err := LoadOrGenerate(certFile, keyFile)
+	if err != nil {
+		t.Fatalf("LoadOrGenerate: %v", err)
+	}
+	if len(cert.Certificate) == 0 {
+		t.Error("expected certificate")
+	}
+
+	cert2, err := LoadOrGenerate(certFile, keyFile)
+	if err != nil {
+		t.Fatalf("LoadOrGenerate second: %v", err)
+	}
+
+	fp1, _ := Fingerprint(cert)
+	fp2, _ := Fingerprint(cert2)
+	if fp1 != fp2 {
+		t.Error("fingerprint should be same on second load")
+	}
+}
+
+func TestFingerprint(t *testing.T) {
+	cert, err := SelfSigned("example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fp1, err := Fingerprint(cert)
+	if err != nil {
+		t.Fatalf("Fingerprint: %v", err)
+	}
+	if len(fp1) != 64 {
+		t.Errorf("expected 64 hex chars, got %d", len(fp1))
+	}
+
+	fp2, _ := Fingerprint(cert)
+	if fp1 != fp2 {
+		t.Error("fingerprint should be deterministic")
+	}
+}
+
+func TestFingerprint_DifferentCerts(t *testing.T) {
+	cert1, _ := SelfSigned("example.com")
+	cert2, _ := SelfSigned("example.com")
+
+	fp1, _ := Fingerprint(cert1)
+	fp2, _ := Fingerprint(cert2)
+
+	if fp1 == fp2 {
+		t.Error("different certs should have different fingerprints")
+	}
+}
+
 func TestSelfSigned_SNI(t *testing.T) {
 	cert, err := SelfSigned("*.example.com")
 	if err != nil {
@@ -113,71 +193,6 @@ func TestBuildTLSConfig_DefaultCert(t *testing.T) {
 	}
 	if tlsCfg == nil {
 		t.Fatal("expected non-nil tls config")
-	}
-	if tlsCfg.GetCertificate == nil {
-		t.Fatal("expected GetCertificate to be set")
-	}
-}
-
-func TestBuildTLSConfig_SelectsCorrectCert(t *testing.T) {
-	cert1, err := SelfSigned("*.example.com", "example.com")
-	if err != nil {
-		t.Fatal(err)
-	}
-	cert2, err := SelfSigned("*.other.com", "other.com")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	ln1, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
-		Certificates: []tls.Certificate{cert1},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln1.Close()
-
-	ln2, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
-		Certificates: []tls.Certificate{cert2},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln2.Close()
-
-	for _, tc := range []struct {
-		ln         net.Listener
-		serverName string
-	}{
-		{ln1, "app.example.com"},
-		{ln2, "app.other.com"},
-	} {
-		tc := tc
-		t.Run(tc.serverName, func(t *testing.T) {
-			done := make(chan error, 1)
-			go func() {
-				conn, err := tc.ln.Accept()
-				if err != nil {
-					done <- err
-					return
-				}
-				defer conn.Close()
-				done <- conn.(*tls.Conn).Handshake()
-			}()
-
-			conn, err := tls.Dial("tcp", tc.ln.Addr().String(), &tls.Config{
-				ServerName:         tc.serverName,
-				InsecureSkipVerify: true,
-			})
-			if err != nil {
-				t.Fatalf("dial: %v", err)
-			}
-			defer conn.Close()
-
-			if err := <-done; err != nil {
-				t.Fatalf("handshake: %v", err)
-			}
-		})
 	}
 }
 

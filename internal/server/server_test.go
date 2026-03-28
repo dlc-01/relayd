@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +15,8 @@ import (
 	"github.com/dlc-01/relayd/internal/config"
 	"github.com/dlc-01/relayd/internal/proto"
 )
+
+var insecureTLS = &tls.Config{InsecureSkipVerify: true}
 
 func freeAddr(t *testing.T) string {
 	t.Helper()
@@ -39,16 +42,19 @@ func freePort(t *testing.T) int {
 
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
+	dir := t.TempDir()
 	cfg := config.ServerConfig{
-		ControlAddr:    freeAddr(t),
-		DataAddr:       freeAddr(t),
-		HTTPAddr:       freeAddr(t),
-		TLSAddr:        freeAddr(t),
-		TLSDomain:      "example.com",
-		MinPublicPort:  1024,
-		MaxPublicPort:  65535,
-		PendingTimeout: 30 * time.Second,
-		Dev:            true,
+		ControlAddr:     freeAddr(t),
+		DataAddr:        freeAddr(t),
+		HTTPAddr:        freeAddr(t),
+		TLSAddr:         freeAddr(t),
+		TLSDomain:       "example.com",
+		ControlCertFile: filepath.Join(dir, "control.crt"),
+		ControlKeyFile:  filepath.Join(dir, "control.key"),
+		MinPublicPort:   1024,
+		MaxPublicPort:   65535,
+		PendingTimeout:  30 * time.Second,
+		Dev:             true,
 	}
 	s := New(cfg)
 	go s.listenControl()
@@ -57,6 +63,15 @@ func newTestServer(t *testing.T) *Server {
 	go s.listenTLS()
 	time.Sleep(50 * time.Millisecond)
 	return s
+}
+
+func dialControl(t *testing.T, s *Server) net.Conn {
+	t.Helper()
+	conn, err := tls.Dial("tcp", s.cfg.ControlAddr, insecureTLS)
+	if err != nil {
+		t.Fatalf("dial control: %v", err)
+	}
+	return conn
 }
 
 func startEchoService(t *testing.T) string {
@@ -87,12 +102,10 @@ func startHTTPService(t *testing.T, response string) string {
 	return ts.Listener.Addr().String()
 }
 
-func connectTestClient(t *testing.T, s *Server, tunnels []proto.TunnelDef, localAddrs map[string]string) chan struct{} {
+func connectTestClient(t *testing.T, s *Server, tunnels []proto.TunnelDef, localAddrs map[string]string) {
 	t.Helper()
-	disconnected := make(chan struct{})
 	go func() {
-		defer close(disconnected)
-		ctrl, err := net.Dial("tcp", s.cfg.ControlAddr)
+		ctrl, err := tls.Dial("tcp", s.cfg.ControlAddr, insecureTLS)
 		if err != nil {
 			return
 		}
@@ -119,7 +132,7 @@ func connectTestClient(t *testing.T, s *Server, tunnels []proto.TunnelDef, local
 				if err != nil {
 					return
 				}
-				dataConn, err := net.Dial("tcp", s.cfg.DataAddr)
+				dataConn, err := tls.Dial("tcp", s.cfg.DataAddr, insecureTLS)
 				if err != nil {
 					localConn.Close()
 					return
@@ -132,14 +145,13 @@ func connectTestClient(t *testing.T, s *Server, tunnels []proto.TunnelDef, local
 			}(msg.ConnID, msg.TunnelID)
 		}
 	}()
-	return disconnected
 }
 
 func TestServer_Register_OK(t *testing.T) {
 	s := newTestServer(t)
 	port := freePort(t)
 
-	ctrl, _ := net.Dial("tcp", s.cfg.ControlAddr)
+	ctrl := dialControl(t, s)
 	defer ctrl.Close()
 
 	proto.Write(ctrl, proto.Message{
@@ -159,7 +171,7 @@ func TestServer_Register_OK(t *testing.T) {
 func TestServer_Register_NoTunnels(t *testing.T) {
 	s := newTestServer(t)
 
-	ctrl, _ := net.Dial("tcp", s.cfg.ControlAddr)
+	ctrl := dialControl(t, s)
 	defer ctrl.Close()
 
 	proto.Write(ctrl, proto.Message{Type: proto.TypeRegister, Tunnels: []proto.TunnelDef{}})
@@ -174,7 +186,7 @@ func TestServer_Register_PortConflict(t *testing.T) {
 	s := newTestServer(t)
 	port := freePort(t)
 
-	ctrl1, _ := net.Dial("tcp", s.cfg.ControlAddr)
+	ctrl1 := dialControl(t, s)
 	defer ctrl1.Close()
 	proto.Write(ctrl1, proto.Message{
 		Type:    proto.TypeRegister,
@@ -182,7 +194,7 @@ func TestServer_Register_PortConflict(t *testing.T) {
 	})
 	proto.Read(ctrl1)
 
-	ctrl2, _ := net.Dial("tcp", s.cfg.ControlAddr)
+	ctrl2 := dialControl(t, s)
 	defer ctrl2.Close()
 	proto.Write(ctrl2, proto.Message{
 		Type:    proto.TypeRegister,
@@ -201,7 +213,7 @@ func TestServer_Register_PortConflict(t *testing.T) {
 func TestServer_Register_HostConflict(t *testing.T) {
 	s := newTestServer(t)
 
-	ctrl1, _ := net.Dial("tcp", s.cfg.ControlAddr)
+	ctrl1 := dialControl(t, s)
 	defer ctrl1.Close()
 	proto.Write(ctrl1, proto.Message{
 		Type:    proto.TypeRegister,
@@ -209,7 +221,7 @@ func TestServer_Register_HostConflict(t *testing.T) {
 	})
 	proto.Read(ctrl1)
 
-	ctrl2, _ := net.Dial("tcp", s.cfg.ControlAddr)
+	ctrl2 := dialControl(t, s)
 	defer ctrl2.Close()
 	proto.Write(ctrl2, proto.Message{
 		Type:    proto.TypeRegister,
@@ -277,12 +289,11 @@ func TestServer_MultiClient_IndependentSessions(t *testing.T) {
 
 func TestServer_MultiClient_DisconnectCleansOnlyOwnTunnels(t *testing.T) {
 	s := newTestServer(t)
-	echo1 := startEchoService(t)
 	echo2 := startEchoService(t)
 	port1 := freePort(t)
 	port2 := freePort(t)
 
-	ctrlA, _ := net.Dial("tcp", s.cfg.ControlAddr)
+	ctrlA := dialControl(t, s)
 	proto.Write(ctrlA, proto.Message{
 		Type:    proto.TypeRegister,
 		Tunnels: []proto.TunnelDef{{TunnelID: "web", PublicPort: port1}},
@@ -324,7 +335,7 @@ func TestServer_MultiClient_DisconnectCleansOnlyOwnTunnels(t *testing.T) {
 		t.Errorf("got %q, want %q", buf, payload)
 	}
 
-	ctrlC, _ := net.Dial("tcp", s.cfg.ControlAddr)
+	ctrlC := dialControl(t, s)
 	defer ctrlC.Close()
 	proto.Write(ctrlC, proto.Message{
 		Type:    proto.TypeRegister,
@@ -334,8 +345,6 @@ func TestServer_MultiClient_DisconnectCleansOnlyOwnTunnels(t *testing.T) {
 	if msg.Type != proto.TypeOK {
 		t.Errorf("expected ok after re-register freed port, got %s reason=%s", msg.Type, msg.Reason)
 	}
-
-	_ = echo1
 }
 
 func TestServer_MultiClient_SameTunnelIDDifferentClients(t *testing.T) {
@@ -343,7 +352,7 @@ func TestServer_MultiClient_SameTunnelIDDifferentClients(t *testing.T) {
 	port1 := freePort(t)
 	port2 := freePort(t)
 
-	ctrl1, _ := net.Dial("tcp", s.cfg.ControlAddr)
+	ctrl1 := dialControl(t, s)
 	defer ctrl1.Close()
 	proto.Write(ctrl1, proto.Message{
 		Type:    proto.TypeRegister,
@@ -351,7 +360,7 @@ func TestServer_MultiClient_SameTunnelIDDifferentClients(t *testing.T) {
 	})
 	proto.Read(ctrl1)
 
-	ctrl2, _ := net.Dial("tcp", s.cfg.ControlAddr)
+	ctrl2 := dialControl(t, s)
 	defer ctrl2.Close()
 	proto.Write(ctrl2, proto.Message{
 		Type:    proto.TypeRegister,
@@ -433,7 +442,7 @@ func TestServer_EndToEnd_HTTPS(t *testing.T) {
 	tlsClient := &http.Client{
 		Timeout: 3 * time.Second,
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			TLSClientConfig: insecureTLS,
 			DialTLS: func(network, addr string) (net.Conn, error) {
 				return tls.Dial(network, s.cfg.TLSAddr, &tls.Config{
 					ServerName:         "secure.example.com",
@@ -458,7 +467,6 @@ func TestServer_EndToEnd_HTTPS(t *testing.T) {
 
 func TestServer_HTTP_NoTunnel_Returns502(t *testing.T) {
 	s := newTestServer(t)
-	time.Sleep(50 * time.Millisecond)
 
 	req, _ := http.NewRequest("GET", "http://"+s.cfg.HTTPAddr+"/", nil)
 	req.Host = "unknown.example.com"
@@ -513,7 +521,7 @@ func TestServer_MultiHost_Aliases(t *testing.T) {
 func TestServer_AliasConflict(t *testing.T) {
 	s := newTestServer(t)
 
-	ctrl1, _ := net.Dial("tcp", s.cfg.ControlAddr)
+	ctrl1 := dialControl(t, s)
 	defer ctrl1.Close()
 	proto.Write(ctrl1, proto.Message{
 		Type: proto.TypeRegister,
@@ -525,7 +533,7 @@ func TestServer_AliasConflict(t *testing.T) {
 	})
 	proto.Read(ctrl1)
 
-	ctrl2, _ := net.Dial("tcp", s.cfg.ControlAddr)
+	ctrl2 := dialControl(t, s)
 	defer ctrl2.Close()
 	proto.Write(ctrl2, proto.Message{
 		Type: proto.TypeRegister,
@@ -547,7 +555,7 @@ func TestServer_AliasConflict(t *testing.T) {
 func TestServer_AliasCleanupOnDisconnect(t *testing.T) {
 	s := newTestServer(t)
 
-	ctrl, _ := net.Dial("tcp", s.cfg.ControlAddr)
+	ctrl := dialControl(t, s)
 	proto.Write(ctrl, proto.Message{
 		Type: proto.TypeRegister,
 		Tunnels: []proto.TunnelDef{{
@@ -562,7 +570,7 @@ func TestServer_AliasCleanupOnDisconnect(t *testing.T) {
 	ctrl.Close()
 	time.Sleep(100 * time.Millisecond)
 
-	ctrl2, _ := net.Dial("tcp", s.cfg.ControlAddr)
+	ctrl2 := dialControl(t, s)
 	defer ctrl2.Close()
 	proto.Write(ctrl2, proto.Message{
 		Type: proto.TypeRegister,
@@ -577,10 +585,11 @@ func TestServer_AliasCleanupOnDisconnect(t *testing.T) {
 		t.Errorf("expected ok after alias freed, got %s reason=%s", msg.Type, msg.Reason)
 	}
 }
+
 func TestServer_Heartbeat(t *testing.T) {
 	s := newTestServer(t)
 
-	ctrl, _ := net.Dial("tcp", s.cfg.ControlAddr)
+	ctrl := dialControl(t, s)
 	defer ctrl.Close()
 
 	proto.Write(ctrl, proto.Message{
@@ -604,16 +613,19 @@ func TestServer_Heartbeat(t *testing.T) {
 }
 
 func TestServer_PendingTimeout(t *testing.T) {
+	dir := t.TempDir()
 	cfg := config.ServerConfig{
-		ControlAddr:    freeAddr(t),
-		DataAddr:       freeAddr(t),
-		HTTPAddr:       freeAddr(t),
-		TLSAddr:        freeAddr(t),
-		TLSDomain:      "example.com",
-		MinPublicPort:  1024,
-		MaxPublicPort:  65535,
-		PendingTimeout: 500 * time.Millisecond,
-		Dev:            true,
+		ControlAddr:     freeAddr(t),
+		DataAddr:        freeAddr(t),
+		HTTPAddr:        freeAddr(t),
+		TLSAddr:         freeAddr(t),
+		TLSDomain:       "example.com",
+		ControlCertFile: filepath.Join(dir, "control.crt"),
+		ControlKeyFile:  filepath.Join(dir, "control.key"),
+		MinPublicPort:   1024,
+		MaxPublicPort:   65535,
+		PendingTimeout:  500 * time.Millisecond,
+		Dev:             true,
 	}
 	s := New(cfg)
 	go s.listenControl()
@@ -622,7 +634,7 @@ func TestServer_PendingTimeout(t *testing.T) {
 	go s.listenTLS()
 	time.Sleep(50 * time.Millisecond)
 
-	ctrl, _ := net.Dial("tcp", s.cfg.ControlAddr)
+	ctrl := dialControl(t, s)
 	defer ctrl.Close()
 
 	proto.Write(ctrl, proto.Message{
