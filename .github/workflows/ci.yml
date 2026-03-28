@@ -116,6 +116,10 @@ jobs:
           Environment=RELAYD_TLS_DOMAIN=${{ secrets.TLS_DOMAIN }}
           Environment=RELAYD_MIN_PORT=10000
           Environment=RELAYD_MAX_PORT=60000
+          Environment=RELAYD_TOKEN=${{ secrets.RELAYD_TOKEN }}
+          Environment=RELAYD_SESSION_TTL=24h
+          Environment=RELAYD_TG_TOKEN=${{ secrets.RELAYD_TG_TOKEN }}
+          Environment=RELAYD_TG_CHAT_ID=${{ secrets.RELAYD_TG_CHAT_ID }}
 
           StandardOutput=journal
           StandardError=journal
