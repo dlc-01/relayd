@@ -7,5 +7,7 @@ import (
 
 func main() {
 	cfg := config.LoadServerConfig()
-	server.New(cfg).Run()
+	s := server.New(cfg)
+	go s.ListenAdmin()
+	s.Run()
 }
