@@ -659,3 +659,253 @@ func TestServer_PendingTimeout(t *testing.T) {
 		t.Error("expected connection to be closed after pending timeout")
 	}
 }
+func TestServer_Auth_NoToken(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.ServerConfig{
+		ControlAddr:     freeAddr(t),
+		DataAddr:        freeAddr(t),
+		HTTPAddr:        freeAddr(t),
+		TLSAddr:         freeAddr(t),
+		TLSDomain:       "example.com",
+		ControlCertFile: filepath.Join(dir, "control.crt"),
+		ControlKeyFile:  filepath.Join(dir, "control.key"),
+		MinPublicPort:   1024,
+		MaxPublicPort:   65535,
+		PendingTimeout:  30 * time.Second,
+		MasterToken:     "master-secret",
+		SessionTTL:      time.Hour,
+		Dev:             true,
+	}
+	s := New(cfg)
+	go s.listenControl()
+	go s.listenData()
+	go s.listenHTTP()
+	go s.listenTLS()
+	time.Sleep(50 * time.Millisecond)
+
+	ctrl := dialControl(t, s)
+	defer ctrl.Close()
+
+	proto.Write(ctrl, proto.Message{
+		Type:    proto.TypeRegister,
+		Tunnels: []proto.TunnelDef{{TunnelID: "web", Host: "app.example.com"}},
+	})
+
+	msg, _ := proto.Read(ctrl)
+	if msg.Type != proto.TypeError {
+		t.Errorf("expected error for missing token, got %s", msg.Type)
+	}
+}
+
+func TestServer_Auth_WrongToken(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.ServerConfig{
+		ControlAddr:     freeAddr(t),
+		DataAddr:        freeAddr(t),
+		HTTPAddr:        freeAddr(t),
+		TLSAddr:         freeAddr(t),
+		TLSDomain:       "example.com",
+		ControlCertFile: filepath.Join(dir, "control.crt"),
+		ControlKeyFile:  filepath.Join(dir, "control.key"),
+		MinPublicPort:   1024,
+		MaxPublicPort:   65535,
+		PendingTimeout:  30 * time.Second,
+		MasterToken:     "master-secret",
+		SessionTTL:      time.Hour,
+		Dev:             true,
+	}
+	s := New(cfg)
+	go s.listenControl()
+	go s.listenData()
+	go s.listenHTTP()
+	go s.listenTLS()
+	time.Sleep(50 * time.Millisecond)
+
+	ctrl := dialControl(t, s)
+	defer ctrl.Close()
+
+	proto.Write(ctrl, proto.Message{
+		Type:    proto.TypeRegister,
+		Token:   "wrong-token",
+		Tunnels: []proto.TunnelDef{{TunnelID: "web", Host: "app.example.com"}},
+	})
+
+	msg, _ := proto.Read(ctrl)
+	if msg.Type != proto.TypeError {
+		t.Errorf("expected error for wrong token, got %s", msg.Type)
+	}
+}
+
+func TestServer_Auth_MasterToken_IssuesTempToken(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.ServerConfig{
+		ControlAddr:     freeAddr(t),
+		DataAddr:        freeAddr(t),
+		HTTPAddr:        freeAddr(t),
+		TLSAddr:         freeAddr(t),
+		TLSDomain:       "example.com",
+		ControlCertFile: filepath.Join(dir, "control.crt"),
+		ControlKeyFile:  filepath.Join(dir, "control.key"),
+		MinPublicPort:   1024,
+		MaxPublicPort:   65535,
+		PendingTimeout:  30 * time.Second,
+		MasterToken:     "master-secret",
+		SessionTTL:      time.Hour,
+		Dev:             true,
+	}
+	s := New(cfg)
+	go s.listenControl()
+	go s.listenData()
+	go s.listenHTTP()
+	go s.listenTLS()
+	time.Sleep(50 * time.Millisecond)
+
+	ctrl := dialControl(t, s)
+	defer ctrl.Close()
+
+	proto.Write(ctrl, proto.Message{
+		Type:    proto.TypeRegister,
+		Token:   "master-secret",
+		Tunnels: []proto.TunnelDef{{TunnelID: "web", Host: "app.example.com"}},
+	})
+
+	msg, err := proto.Read(ctrl)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if msg.Type != proto.TypeOK {
+		t.Fatalf("expected ok, got %s reason=%s", msg.Type, msg.Reason)
+	}
+	if msg.TempToken == "" {
+		t.Error("expected temp token in response")
+	}
+	if msg.ExpiresAt == "" {
+		t.Error("expected expires_at in response")
+	}
+}
+
+func TestServer_Auth_TempToken_Works(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.ServerConfig{
+		ControlAddr:     freeAddr(t),
+		DataAddr:        freeAddr(t),
+		HTTPAddr:        freeAddr(t),
+		TLSAddr:         freeAddr(t),
+		TLSDomain:       "example.com",
+		ControlCertFile: filepath.Join(dir, "control.crt"),
+		ControlKeyFile:  filepath.Join(dir, "control.key"),
+		MinPublicPort:   1024,
+		MaxPublicPort:   65535,
+		PendingTimeout:  30 * time.Second,
+		MasterToken:     "master-secret",
+		SessionTTL:      time.Hour,
+		Dev:             true,
+	}
+	s := New(cfg)
+	go s.listenControl()
+	go s.listenData()
+	go s.listenHTTP()
+	go s.listenTLS()
+	time.Sleep(50 * time.Millisecond)
+
+	ctrl1 := dialControl(t, s)
+	proto.Write(ctrl1, proto.Message{
+		Type:    proto.TypeRegister,
+		Token:   "master-secret",
+		Tunnels: []proto.TunnelDef{{TunnelID: "web", Host: "app.example.com"}},
+	})
+	msg1, _ := proto.Read(ctrl1)
+	if msg1.Type != proto.TypeOK {
+		t.Fatalf("expected ok, got %s", msg1.Type)
+	}
+	tempToken := msg1.TempToken
+	ctrl1.Close()
+	time.Sleep(50 * time.Millisecond)
+
+	ctrl2 := dialControl(t, s)
+	defer ctrl2.Close()
+	proto.Write(ctrl2, proto.Message{
+		Type:    proto.TypeRegister,
+		Token:   tempToken,
+		Tunnels: []proto.TunnelDef{{TunnelID: "web", Host: "app.example.com"}},
+	})
+	msg2, err := proto.Read(ctrl2)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if msg2.Type != proto.TypeOK {
+		t.Errorf("expected ok with temp token, got %s reason=%s", msg2.Type, msg2.Reason)
+	}
+	if msg2.TempToken != "" {
+		t.Error("expected no new temp token when using existing temp token")
+	}
+}
+
+func TestServer_Auth_Disabled_NoTokenRequired(t *testing.T) {
+	s := newTestServer(t)
+
+	ctrl := dialControl(t, s)
+	defer ctrl.Close()
+
+	proto.Write(ctrl, proto.Message{
+		Type:    proto.TypeRegister,
+		Tunnels: []proto.TunnelDef{{TunnelID: "web", Host: "app.example.com"}},
+	})
+
+	msg, err := proto.Read(ctrl)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if msg.Type != proto.TypeOK {
+		t.Errorf("expected ok without auth, got %s reason=%s", msg.Type, msg.Reason)
+	}
+}
+
+func TestServer_Auth_ExpiredTempToken(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.ServerConfig{
+		ControlAddr:     freeAddr(t),
+		DataAddr:        freeAddr(t),
+		HTTPAddr:        freeAddr(t),
+		TLSAddr:         freeAddr(t),
+		TLSDomain:       "example.com",
+		ControlCertFile: filepath.Join(dir, "control.crt"),
+		ControlKeyFile:  filepath.Join(dir, "control.key"),
+		MinPublicPort:   1024,
+		MaxPublicPort:   65535,
+		PendingTimeout:  30 * time.Second,
+		MasterToken:     "master-secret",
+		SessionTTL:      20 * time.Millisecond,
+		Dev:             true,
+	}
+	s := New(cfg)
+	go s.listenControl()
+	go s.listenData()
+	go s.listenHTTP()
+	go s.listenTLS()
+	time.Sleep(50 * time.Millisecond)
+
+	ctrl1 := dialControl(t, s)
+	proto.Write(ctrl1, proto.Message{
+		Type:    proto.TypeRegister,
+		Token:   "master-secret",
+		Tunnels: []proto.TunnelDef{{TunnelID: "web", Host: "app.example.com"}},
+	})
+	msg1, _ := proto.Read(ctrl1)
+	tempToken := msg1.TempToken
+	ctrl1.Close()
+	time.Sleep(50 * time.Millisecond)
+
+	ctrl2 := dialControl(t, s)
+	defer ctrl2.Close()
+	proto.Write(ctrl2, proto.Message{
+		Type:    proto.TypeRegister,
+		Token:   tempToken,
+		Tunnels: []proto.TunnelDef{{TunnelID: "web", Host: "app.example.com"}},
+	})
+
+	msg2, _ := proto.Read(ctrl2)
+	if msg2.Type != proto.TypeError {
+		t.Errorf("expected error for expired token, got %s", msg2.Type)
+	}
+}

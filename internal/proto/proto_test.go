@@ -8,7 +8,8 @@ import (
 func TestWriteRead_AllTypes(t *testing.T) {
 	cases := []Message{
 		{
-			Type: TypeRegister,
+			Type:  TypeRegister,
+			Token: "my-secret-token",
 			Tunnels: []TunnelDef{
 				{TunnelID: "web", PublicPort: 10001},
 				{TunnelID: "app", Host: "app.example.com"},
@@ -16,6 +17,11 @@ func TestWriteRead_AllTypes(t *testing.T) {
 			},
 		},
 		{Type: TypeOK},
+		{
+			Type:      TypeOK,
+			TempToken: "a3f9b2c1d4e5",
+			ExpiresAt: "2026-03-29T11:00:00Z",
+		},
 		{Type: TypeConnect, ConnID: "abc-123", TunnelID: "web"},
 		{Type: TypeData, ConnID: "abc-123"},
 		{Type: TypeError, Reason: "port already in use"},
@@ -25,7 +31,7 @@ func TestWriteRead_AllTypes(t *testing.T) {
 
 	for _, msg := range cases {
 		msg := msg
-		t.Run(string(msg.Type), func(t *testing.T) {
+		t.Run(string(msg.Type)+"_"+msg.TempToken, func(t *testing.T) {
 			server, client := net.Pipe()
 			defer server.Close()
 			defer client.Close()
@@ -42,6 +48,15 @@ func TestWriteRead_AllTypes(t *testing.T) {
 			}
 			if got.Type != msg.Type {
 				t.Errorf("type: got %s, want %s", got.Type, msg.Type)
+			}
+			if got.Token != msg.Token {
+				t.Errorf("token: got %s, want %s", got.Token, msg.Token)
+			}
+			if got.TempToken != msg.TempToken {
+				t.Errorf("temp_token: got %s, want %s", got.TempToken, msg.TempToken)
+			}
+			if got.ExpiresAt != msg.ExpiresAt {
+				t.Errorf("expires_at: got %s, want %s", got.ExpiresAt, msg.ExpiresAt)
 			}
 			if got.ConnID != msg.ConnID {
 				t.Errorf("conn_id: got %s, want %s", got.ConnID, msg.ConnID)
@@ -69,6 +84,76 @@ func TestWriteRead_AllTypes(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestWriteRead_TokenOmitEmpty(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	go func() {
+		Write(server, Message{Type: TypeOK})
+	}()
+
+	got, err := Read(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Token != "" {
+		t.Errorf("expected empty token, got %s", got.Token)
+	}
+	if got.TempToken != "" {
+		t.Errorf("expected empty temp_token, got %s", got.TempToken)
+	}
+}
+
+func TestWriteRead_Register_WithToken(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	msg := Message{
+		Type:  TypeRegister,
+		Token: "secret-token",
+		Tunnels: []TunnelDef{
+			{TunnelID: "web", PublicPort: 10001},
+		},
+	}
+
+	go func() { Write(server, msg) }()
+
+	got, err := Read(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Token != "secret-token" {
+		t.Errorf("token: got %s, want secret-token", got.Token)
+	}
+}
+
+func TestWriteRead_OK_WithTempToken(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	msg := Message{
+		Type:      TypeOK,
+		TempToken: "a3f9b2c1d4e5",
+		ExpiresAt: "2026-03-29T11:00:00Z",
+	}
+
+	go func() { Write(server, msg) }()
+
+	got, err := Read(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TempToken != "a3f9b2c1d4e5" {
+		t.Errorf("temp_token: got %s", got.TempToken)
+	}
+	if got.ExpiresAt != "2026-03-29T11:00:00Z" {
+		t.Errorf("expires_at: got %s", got.ExpiresAt)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dlc-01/relayd/internal/auth"
 	"github.com/dlc-01/relayd/internal/config"
 	"github.com/dlc-01/relayd/internal/httpparse"
 	"github.com/dlc-01/relayd/internal/logger"
@@ -31,14 +32,16 @@ type clientSession struct {
 }
 
 type Server struct {
-	cfg      config.ServerConfig
-	log      *zap.SugaredLogger
-	mu       sync.Mutex
-	pending  map[string]pendingConn
-	ports    map[int]string
-	hosts    map[string]string
-	tunnels  map[string]net.Conn
-	sessions map[string]*clientSession
+	cfg         config.ServerConfig
+	log         *zap.SugaredLogger
+	mu          sync.Mutex
+	pending     map[string]pendingConn
+	ports       map[int]string
+	hosts       map[string]string
+	tunnels     map[string]net.Conn
+	sessions    map[string]*clientSession
+	auth        *auth.Manager
+	controlCert tls.Certificate
 }
 
 func New(cfg config.ServerConfig) *Server {
@@ -48,14 +51,36 @@ func New(cfg config.ServerConfig) *Server {
 	} else {
 		log = logger.New("server")
 	}
+
+	var mgr *auth.Manager
+	if cfg.MasterToken != "" {
+		var err error
+		mgr, err = auth.NewManager(cfg.MasterToken, cfg.SessionTTL)
+		if err != nil {
+			log.Fatalw("auth manager failed", "err", err)
+		}
+		log.Infow("auth enabled", "session_ttl", cfg.SessionTTL)
+	} else {
+		log.Warnw("auth disabled — set RELAYD_TOKEN to enable")
+	}
+
+	cert, err := tlscerts.LoadOrGenerate(cfg.ControlCertFile, cfg.ControlKeyFile)
+	if err != nil {
+		log.Fatalw("load control cert failed", "err", err)
+	}
+	fp, _ := tlscerts.Fingerprint(cert)
+	log.Infow("control tls ready", "fingerprint", fp)
+
 	return &Server{
-		cfg:      cfg,
-		log:      log,
-		pending:  make(map[string]pendingConn),
-		ports:    make(map[int]string),
-		hosts:    make(map[string]string),
-		tunnels:  make(map[string]net.Conn),
-		sessions: make(map[string]*clientSession),
+		cfg:         cfg,
+		log:         log,
+		pending:     make(map[string]pendingConn),
+		ports:       make(map[int]string),
+		hosts:       make(map[string]string),
+		tunnels:     make(map[string]net.Conn),
+		sessions:    make(map[string]*clientSession),
+		auth:        mgr,
+		controlCert: cert,
 	}
 }
 
@@ -68,24 +93,12 @@ func (s *Server) Run() {
 }
 
 func (s *Server) listenControl() {
-	cert, err := tlscerts.LoadOrGenerate(s.cfg.ControlCertFile, s.cfg.ControlKeyFile)
-	if err != nil {
-		s.log.Fatalw("load control cert failed", "err", err)
-	}
-
-	fp, err := tlscerts.Fingerprint(cert)
-	if err != nil {
-		s.log.Fatalw("fingerprint failed", "err", err)
-	}
-	s.log.Infow("control tls ready", "fingerprint", fp)
-
-	tlsCfg := &tls.Config{Certificates: []tls.Certificate{cert}}
+	tlsCfg := &tls.Config{Certificates: []tls.Certificate{s.controlCert}}
 	ln, err := tls.Listen("tcp", s.cfg.ControlAddr, tlsCfg)
 	if err != nil {
 		s.log.Fatalw("control listen failed", "addr", s.cfg.ControlAddr, "err", err)
 	}
 	s.log.Infow("control listening", "addr", s.cfg.ControlAddr)
-
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -97,6 +110,32 @@ func (s *Server) listenControl() {
 	}
 }
 
+func (s *Server) authAndIssue(token, remote string) (tempToken string, expiresAt string, err error) {
+	if s.auth == nil {
+		return "", "", nil
+	}
+
+	entry, err := s.auth.Validate(token)
+	if err != nil {
+		return "", "", err
+	}
+
+	if entry.IsMaster() {
+		temp, err := s.auth.IssueForMaster(remote)
+		if err != nil {
+			return "", "", fmt.Errorf("issue temp token: %w", err)
+		}
+		s.log.Infow("issued temp token",
+			"remote", remote,
+			"expires_at", temp.ExpiresAt,
+		)
+		return temp.Token, temp.ExpiresAt.Format(time.RFC3339), nil
+	}
+
+	s.log.Infow("auth ok", "remote", remote, "label", entry.Label)
+	return "", "", nil
+}
+
 func (s *Server) handleControl(ctrl net.Conn) {
 	defer ctrl.Close()
 	remote := ctrl.RemoteAddr().String()
@@ -104,6 +143,16 @@ func (s *Server) handleControl(ctrl net.Conn) {
 	msg, err := proto.Read(ctrl)
 	if err != nil || msg.Type != proto.TypeRegister {
 		s.log.Warnw("expected register", "remote", remote, "got", msg.Type, "err", err)
+		return
+	}
+
+	tempToken, expiresAt, err := s.authAndIssue(msg.Token, remote)
+	if err != nil {
+		s.log.Warnw("auth failed", "remote", remote, "err", err)
+		proto.Write(ctrl, proto.Message{
+			Type:   proto.TypeError,
+			Reason: err.Error(),
+		})
 		return
 	}
 
@@ -211,7 +260,12 @@ func (s *Server) handleControl(ctrl net.Conn) {
 	}
 	s.mu.Unlock()
 
-	if err := proto.Write(ctrl, proto.Message{Type: proto.TypeOK}); err != nil {
+	okMsg := proto.Message{Type: proto.TypeOK}
+	if tempToken != "" {
+		okMsg.TempToken = tempToken
+		okMsg.ExpiresAt = expiresAt
+	}
+	if err := proto.Write(ctrl, okMsg); err != nil {
 		s.log.Errorw("write ok failed", "remote", remote, "err", err)
 		s.removeSession(session)
 		return
@@ -292,18 +346,12 @@ func (s *Server) removeSession(session *clientSession) {
 }
 
 func (s *Server) listenData() {
-	cert, err := tlscerts.LoadOrGenerate(s.cfg.ControlCertFile, s.cfg.ControlKeyFile)
-	if err != nil {
-		s.log.Fatalw("load data cert failed", "err", err)
-	}
-
-	tlsCfg := &tls.Config{Certificates: []tls.Certificate{cert}}
+	tlsCfg := &tls.Config{Certificates: []tls.Certificate{s.controlCert}}
 	ln, err := tls.Listen("tcp", s.cfg.DataAddr, tlsCfg)
 	if err != nil {
 		s.log.Fatalw("data listen failed", "addr", s.cfg.DataAddr, "err", err)
 	}
 	s.log.Infow("data listening", "addr", s.cfg.DataAddr)
-
 	for {
 		conn, err := ln.Accept()
 		if err != nil {

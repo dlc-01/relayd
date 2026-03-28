@@ -22,6 +22,9 @@ type ServerConfig struct {
 	MinPublicPort   int
 	MaxPublicPort   int
 	PendingTimeout  time.Duration
+	MasterToken     string
+	SessionTTL      time.Duration
+	AdminAddr       string
 	Dev             bool
 }
 
@@ -38,6 +41,8 @@ type ClientConfig struct {
 	ServerDataAddr    string
 	Tunnels           []TunnelConfig
 	PinFile           string
+	Token             string
+	SessionFile       string
 	Dev               bool
 }
 
@@ -61,6 +66,9 @@ func LoadServerConfig() ServerConfig {
 		MinPublicPort:   getEnvInt("RELAYD_MIN_PORT", 10000),
 		MaxPublicPort:   getEnvInt("RELAYD_MAX_PORT", 60000),
 		PendingTimeout:  getEnvDuration("RELAYD_PENDING_TIMEOUT", 30*time.Second),
+		MasterToken:     getEnv("RELAYD_TOKEN", ""),
+		SessionTTL:      getEnvDuration("RELAYD_SESSION_TTL", 24*time.Hour),
+		AdminAddr:       getEnv("RELAYD_ADMIN_ADDR", "127.0.0.1:7002"),
 		Dev:             getEnv("RELAYD_DEV", "false") == "true",
 	}
 
@@ -99,11 +107,14 @@ func LoadClientConfig() ClientConfig {
 			tunnels = append(tunnels, t)
 		}
 	}
+	home := os.Getenv("HOME")
 	return ClientConfig{
 		ServerControlAddr: getEnv("RELAYD_SERVER_CONTROL", "localhost:7000"),
 		ServerDataAddr:    getEnv("RELAYD_SERVER_DATA", "localhost:7001"),
 		Tunnels:           tunnels,
-		PinFile:           getEnv("RELAYD_PIN_FILE", filepath.Join(os.Getenv("HOME"), ".relayd", "server.pin")),
+		PinFile:           getEnv("RELAYD_PIN_FILE", filepath.Join(home, ".relayd", "server.pin")),
+		Token:             getEnv("RELAYD_TOKEN", ""),
+		SessionFile:       getEnv("RELAYD_SESSION_FILE", filepath.Join(home, ".relayd", "session.json")),
 		Dev:               getEnv("RELAYD_DEV", "false") == "true",
 	}
 }

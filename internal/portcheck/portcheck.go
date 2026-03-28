@@ -70,7 +70,8 @@ func checkProcNet(path string, port int) (bool, error) {
 func IsForbidden(port int) bool {
 	forbidden := map[int]bool{
 		22: true, 25: true, 53: true,
-		80: true, 443: true,
+		80: true, 443: true, 7000: true,
+		7001: true, 7002: true,
 	}
 	return port < 1024 || forbidden[port]
 }

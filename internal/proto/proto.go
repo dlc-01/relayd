@@ -26,11 +26,14 @@ type TunnelDef struct {
 }
 
 type Message struct {
-	Type     MessageType `json:"type"`
-	Tunnels  []TunnelDef `json:"tunnels,omitempty"`
-	TunnelID string      `json:"tunnel_id,omitempty"`
-	ConnID   string      `json:"conn_id,omitempty"`
-	Reason   string      `json:"reason,omitempty"`
+	Type      MessageType `json:"type"`
+	Token     string      `json:"token,omitempty"`
+	TempToken string      `json:"temp_token,omitempty"`
+	ExpiresAt string      `json:"expires_at,omitempty"`
+	Tunnels   []TunnelDef `json:"tunnels,omitempty"`
+	TunnelID  string      `json:"tunnel_id,omitempty"`
+	ConnID    string      `json:"conn_id,omitempty"`
+	Reason    string      `json:"reason,omitempty"`
 }
 
 func Write(conn net.Conn, msg Message) error {

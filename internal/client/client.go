@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"github.com/dlc-01/relayd/internal/logger"
 	"github.com/dlc-01/relayd/internal/pin"
 	"github.com/dlc-01/relayd/internal/proto"
+	"github.com/dlc-01/relayd/internal/session"
 	"go.uber.org/zap"
 )
 
@@ -48,14 +50,31 @@ func New(cfg config.ClientConfig) *Client {
 	}
 }
 
+type authError struct {
+	reason string
+}
+
+func (e *authError) Error() string {
+	return fmt.Sprintf("auth failed: %s", e.reason)
+}
+
 func (c *Client) Run() {
 	backoff := c.reconnectInitial
 	for {
 		err := c.connect()
 		if err != nil {
-			c.log.Warnw("connection failed, reconnecting", "err", err, "backoff", backoff)
+			var ae *authError
+			if errors.As(err, &ae) {
+				c.log.Fatalw("authentication failed, check your token", "reason", ae.reason)
+			}
+			c.log.Warnw("connection failed, reconnecting",
+				"err", err,
+				"backoff", backoff,
+			)
 		} else {
-			c.log.Warnw("disconnected, reconnecting", "backoff", backoff)
+			c.log.Warnw("disconnected, reconnecting",
+				"backoff", backoff,
+			)
 		}
 		time.Sleep(backoff)
 		backoff *= 2
@@ -63,6 +82,19 @@ func (c *Client) Run() {
 			backoff = c.reconnectMax
 		}
 	}
+}
+
+func (c *Client) activeToken() string {
+	if session.Exists(c.cfg.SessionFile) {
+		s, err := session.Load(c.cfg.SessionFile)
+		if err == nil && !s.IsExpired() {
+			c.log.Debugw("using saved session", "label", s.Label, "expires_at", s.ExpiresAt)
+			return s.TempToken
+		}
+		c.log.Infow("session expired, will re-authenticate with master token")
+		session.Delete(c.cfg.SessionFile)
+	}
+	return c.cfg.Token
 }
 
 func (c *Client) connect() error {
@@ -86,6 +118,8 @@ func (c *Client) connect() error {
 		return fmt.Errorf("pin verification failed: %w", err)
 	}
 
+	token := c.activeToken()
+
 	var defs []proto.TunnelDef
 	for _, t := range c.cfg.Tunnels {
 		defs = append(defs, proto.TunnelDef{
@@ -98,6 +132,7 @@ func (c *Client) connect() error {
 
 	if err := proto.Write(ctrl, proto.Message{
 		Type:    proto.TypeRegister,
+		Token:   token,
 		Tunnels: defs,
 	}); err != nil {
 		return err
@@ -108,10 +143,33 @@ func (c *Client) connect() error {
 		return err
 	}
 	if msg.Type == proto.TypeError {
-		c.log.Fatalw("register rejected", "reason", msg.Reason)
+		if msg.Reason == "token expired" {
+			c.log.Warnw("session expired, deleting session file")
+			session.Delete(c.cfg.SessionFile)
+		}
+		return &authError{reason: msg.Reason}
 	}
 	if msg.Type != proto.TypeOK {
 		return fmt.Errorf("unexpected register response: %s", msg.Type)
+	}
+
+	if msg.TempToken != "" {
+		expiresAt, err := time.Parse(time.RFC3339, msg.ExpiresAt)
+		if err != nil {
+			expiresAt = time.Now().Add(24 * time.Hour)
+		}
+		s := &session.Session{
+			TempToken: msg.TempToken,
+			ExpiresAt: expiresAt,
+			Label:     "session",
+		}
+		if err := session.Save(c.cfg.SessionFile, s); err != nil {
+			c.log.Warnw("failed to save session", "err", err)
+		} else {
+			c.log.Infow("session saved",
+				"expires_at", expiresAt.Format(time.RFC3339),
+			)
+		}
 	}
 
 	c.log.Infow("registered tunnels", "count", len(c.cfg.Tunnels))

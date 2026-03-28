@@ -2,6 +2,7 @@ package client
 
 import (
 	"crypto/tls"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -10,9 +11,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dlc-01/relayd/internal/auth"
 	"github.com/dlc-01/relayd/internal/config"
 	"github.com/dlc-01/relayd/internal/pin"
 	"github.com/dlc-01/relayd/internal/proto"
+	"github.com/dlc-01/relayd/internal/session"
 	"github.com/dlc-01/relayd/internal/tlscerts"
 )
 
@@ -349,5 +352,199 @@ func TestClient_UnknownTunnelID(t *testing.T) {
 		conn.Close()
 		t.Error("expected no data connection for unknown tunnel_id")
 	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+func startAuthFakeServer(t *testing.T, masterToken string, sessionTTL time.Duration) (ctrlAddr, dataAddr string) {
+	t.Helper()
+
+	cert, _ := tlscerts.SelfSigned("relayd-control")
+	tlsCfg := &tls.Config{Certificates: []tls.Certificate{cert}}
+
+	dataLn, err := tls.Listen("tcp", "127.0.0.1:0", tlsCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataAddr = dataLn.Addr().String()
+	t.Cleanup(func() { dataLn.Close() })
+	go func() {
+		for {
+			conn, err := dataLn.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+
+	ctrlLn, err := tls.Listen("tcp", "127.0.0.1:0", tlsCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctrlAddr = ctrlLn.Addr().String()
+	t.Cleanup(func() { ctrlLn.Close() })
+
+	mgr, _ := auth.NewManager(masterToken, sessionTTL)
+
+	go func() {
+		for {
+			conn, err := ctrlLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				msg, err := proto.Read(conn)
+				if err != nil || msg.Type != proto.TypeRegister {
+					return
+				}
+				entry, err := mgr.Validate(msg.Token)
+				if err != nil {
+					proto.Write(conn, proto.Message{
+						Type:   proto.TypeError,
+						Reason: err.Error(),
+					})
+					return
+				}
+				okMsg := proto.Message{Type: proto.TypeOK}
+				if entry.IsMaster() {
+					temp, _ := mgr.IssueForMaster(conn.RemoteAddr().String())
+					okMsg.TempToken = temp.Token
+					okMsg.ExpiresAt = temp.ExpiresAt.Format(time.RFC3339)
+				}
+				proto.Write(conn, okMsg)
+				time.Sleep(500 * time.Millisecond)
+			}(conn)
+		}
+	}()
+
+	return ctrlAddr, dataAddr
+}
+
+func TestClient_Auth_MasterToken_SavesSession(t *testing.T) {
+	ctrlAddr, dataAddr := startAuthFakeServer(t, "master-secret", time.Hour)
+
+	sessionFile := filepath.Join(t.TempDir(), "session.json")
+	cfg := config.ClientConfig{
+		ServerControlAddr: ctrlAddr,
+		ServerDataAddr:    dataAddr,
+		Tunnels:           []config.TunnelConfig{{TunnelID: "web", Host: "app.example.com", LocalAddr: "127.0.0.1:8080"}},
+		PinFile:           filepath.Join(t.TempDir(), "server.pin"),
+		Token:             "master-secret",
+		SessionFile:       sessionFile,
+		Dev:               true,
+	}
+
+	c := New(cfg)
+	done := make(chan error, 1)
+	go func() { done <- c.connect() }()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout")
+	}
+
+	if !session.Exists(sessionFile) {
+		t.Fatal("expected session file to be saved")
+	}
+
+	s, err := session.Load(sessionFile)
+	if err != nil {
+		t.Fatalf("load session: %v", err)
+	}
+	if s.TempToken == "" {
+		t.Error("expected non-empty temp token in session")
+	}
+	if s.IsExpired() {
+		t.Error("expected session not to be expired")
+	}
+}
+
+func TestClient_Auth_WrongToken_Fatal(t *testing.T) {
+	ctrlAddr, dataAddr := startAuthFakeServer(t, "master-secret", time.Hour)
+
+	cfg := config.ClientConfig{
+		ServerControlAddr: ctrlAddr,
+		ServerDataAddr:    dataAddr,
+		Tunnels:           []config.TunnelConfig{{TunnelID: "web", Host: "app.example.com", LocalAddr: "127.0.0.1:8080"}},
+		PinFile:           filepath.Join(t.TempDir(), "server.pin"),
+		Token:             "wrong-token",
+		SessionFile:       filepath.Join(t.TempDir(), "session.json"),
+		Dev:               true,
+	}
+
+	c := New(cfg)
+	err := c.connect()
+
+	var ae *authError
+	if !errors.As(err, &ae) {
+		t.Errorf("expected authError, got %v", err)
+	}
+}
+
+func TestClient_Auth_UsesSessionFile(t *testing.T) {
+	ctrlAddr, dataAddr := startAuthFakeServer(t, "master-secret", time.Hour)
+
+	dir := t.TempDir()
+	sessionFile := filepath.Join(dir, "session.json")
+	pinFile := filepath.Join(dir, "server.pin")
+
+	cfg := config.ClientConfig{
+		ServerControlAddr: ctrlAddr,
+		ServerDataAddr:    dataAddr,
+		Tunnels:           []config.TunnelConfig{{TunnelID: "web", Host: "app.example.com", LocalAddr: "127.0.0.1:8080"}},
+		PinFile:           pinFile,
+		Token:             "master-secret",
+		SessionFile:       sessionFile,
+		Dev:               true,
+	}
+
+	c := New(cfg)
+	done := make(chan error, 1)
+	go func() { done <- c.connect() }()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout on first connect")
+	}
+
+	s, _ := session.Load(sessionFile)
+	if s.TempToken == "" {
+		t.Fatal("expected session saved after first connect")
+	}
+
+	token := c.activeToken()
+	if token != s.TempToken {
+		t.Errorf("expected activeToken to return temp token, got %s", token)
+	}
+}
+
+func TestClient_Auth_ExpiredSession_FallsBackToMaster(t *testing.T) {
+	dir := t.TempDir()
+	sessionFile := filepath.Join(dir, "session.json")
+
+	expiredSession := &session.Session{
+		TempToken: "expired-token",
+		ExpiresAt: time.Now().Add(-time.Hour),
+		Label:     "session",
+	}
+	session.Save(sessionFile, expiredSession)
+
+	cfg := config.ClientConfig{
+		Token:       "master-secret",
+		SessionFile: sessionFile,
+		Dev:         true,
+	}
+
+	c := New(cfg)
+	token := c.activeToken()
+
+	if token != "master-secret" {
+		t.Errorf("expected master token after expired session, got %s", token)
+	}
+	if session.Exists(sessionFile) {
+		t.Error("expected expired session file to be deleted")
 	}
 }
