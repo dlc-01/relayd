@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/dlc-01/relayd/internal/config"
 	"github.com/dlc-01/relayd/internal/httpparse"
 	"github.com/dlc-01/relayd/internal/logger"
+	"github.com/dlc-01/relayd/internal/notify"
 	"github.com/dlc-01/relayd/internal/portcheck"
 	"github.com/dlc-01/relayd/internal/proto"
 	"github.com/dlc-01/relayd/internal/tlscerts"
@@ -42,6 +44,7 @@ type Server struct {
 	sessions    map[string]*clientSession
 	auth        *auth.Manager
 	controlCert tls.Certificate
+	notify      notify.Notifier
 }
 
 func New(cfg config.ServerConfig) *Server {
@@ -81,10 +84,26 @@ func New(cfg config.ServerConfig) *Server {
 		sessions:    make(map[string]*clientSession),
 		auth:        mgr,
 		controlCert: cert,
+		notify:      buildNotifier(cfg),
 	}
 }
 
+func buildNotifier(cfg config.ServerConfig) notify.Notifier {
+	var notifiers []notify.Notifier
+
+	if cfg.TGToken != "" && cfg.TGChatID != "" {
+		notifiers = append(notifiers, notify.NewTelegram(cfg.TGToken, cfg.TGChatID))
+	}
+
+	if len(notifiers) == 0 {
+		return &notify.NoopNotifier{}
+	}
+
+	return notify.NewMulti(notifiers...)
+}
+
 func (s *Server) Run() {
+	s.notify.ServerStarted(s.cfg.ControlAddr)
 	go s.listenControl()
 	go s.listenData()
 	go s.listenHTTP()
@@ -117,6 +136,7 @@ func (s *Server) authAndIssue(token, remote string) (tempToken string, expiresAt
 
 	entry, err := s.auth.Validate(token)
 	if err != nil {
+		s.notify.InvalidToken(remote)
 		return "", "", err
 	}
 
@@ -287,13 +307,29 @@ func (s *Server) handleControl(ctrl net.Conn) {
 		"tunnels", len(msg.Tunnels),
 	)
 
+	tunnelNames := tunnelNamesFromDefs(msg.Tunnels)
+	s.notify.ClientConnected(remote, tunnelNames, remote)
 	s.readControlLoop(ctrl, session)
 
 	s.log.Infow("client disconnected",
 		"remote", remote,
 		"session_id", session.id,
 	)
+
+	s.notify.ClientDisconnected(remote, remote)
 	s.removeSession(session)
+}
+
+func tunnelNamesFromDefs(tunnels []proto.TunnelDef) string {
+	names := make([]string, 0, len(tunnels))
+	for _, t := range tunnels {
+		if t.Host != "" {
+			names = append(names, t.Host)
+		} else {
+			names = append(names, fmt.Sprintf(":%d", t.PublicPort))
+		}
+	}
+	return strings.Join(names, ", ")
 }
 
 func (s *Server) readControlLoop(ctrl net.Conn, session *clientSession) {

@@ -25,6 +25,8 @@ type ServerConfig struct {
 	MasterToken     string
 	SessionTTL      time.Duration
 	AdminAddr       string
+	TGToken         string
+	TGChatID        string
 	Dev             bool
 }
 
@@ -69,6 +71,8 @@ func LoadServerConfig() ServerConfig {
 		MasterToken:     getEnv("RELAYD_TOKEN", ""),
 		SessionTTL:      getEnvDuration("RELAYD_SESSION_TTL", 24*time.Hour),
 		AdminAddr:       getEnv("RELAYD_ADMIN_ADDR", "127.0.0.1:7002"),
+		TGToken:         getEnv("RELAYD_TG_TOKEN", ""),
+		TGChatID:        getEnv("RELAYD_TG_CHAT_ID", ""),
 		Dev:             getEnv("RELAYD_DEV", "false") == "true",
 	}
 
