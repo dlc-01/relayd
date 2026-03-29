@@ -17,10 +17,10 @@ func newTestServerWithAuth(t *testing.T) *Server {
 	t.Helper()
 	dir := t.TempDir()
 	cfg := config.ServerConfig{
-		ControlAddr:     freeAddr(t),
-		DataAddr:        freeAddr(t),
-		HTTPAddr:        freeAddr(t),
-		TLSAddr:         freeAddr(t),
+		ControlAddr:     freeAddrTB(t),
+		DataAddr:        freeAddrTB(t),
+		HTTPAddr:        freeAddrTB(t),
+		TLSAddr:         freeAddrTB(t),
 		TLSDomain:       "example.com",
 		ControlCertFile: filepath.Join(dir, "control.crt"),
 		ControlKeyFile:  filepath.Join(dir, "control.key"),
@@ -291,10 +291,10 @@ func TestHandleTokenRevoke_BadJSON(t *testing.T) {
 func TestListenAdmin_DisabledWithoutAuth(t *testing.T) {
 	dir := t.TempDir()
 	cfg := config.ServerConfig{
-		ControlAddr:     freeAddr(t),
-		DataAddr:        freeAddr(t),
-		HTTPAddr:        freeAddr(t),
-		TLSAddr:         freeAddr(t),
+		ControlAddr:     freeAddrTB(t),
+		DataAddr:        freeAddrTB(t),
+		HTTPAddr:        freeAddrTB(t),
+		TLSAddr:         freeAddrTB(t),
 		TLSDomain:       "example.com",
 		ControlCertFile: filepath.Join(dir, "control.crt"),
 		ControlKeyFile:  filepath.Join(dir, "control.key"),

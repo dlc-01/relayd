@@ -12,26 +12,54 @@
 
 Want to see it in action without setting up a server?
 
-**Demo credentials are available in my resume.** With them you can expose your local service in 30 seconds:
-```bash
-# 1. install
-go install github.com/dlc-01/relayd/cmd/relayd@latest
+**Demo access** — credentials available in resume. Setup takes ~30 seconds.
 
-# 2. start your local service (anything works — Next.js, FastAPI, etc.)
+### Option 1 — Download binary (no Go required)
+```bash
+# linux/amd64
+curl -L https://github.com/dlc-01/relayd/releases/latest/download/relayd-linux-amd64 -o relayd
+chmod +x relayd
+./relayd client ...
+
+# macOS (Apple Silicon)
+curl -L https://github.com/dlc-01/relayd/releases/latest/download/relayd-darwin-arm64 -o relayd
+chmod +x relayd
+./relayd client ...
+
+# macOS (Intel)
+curl -L https://github.com/dlc-01/relayd/releases/latest/download/relayd-darwin-amd64 -o relayd
+chmod +x relayd
+./relayd client ...
+
+# Windows (PowerShell)
+Invoke-WebRequest -Uri https://github.com/dlc-01/relayd/releases/latest/download/relayd-windows-amd64.exe -OutFile relayd.exe
+.\relayd.exe client ...
+```
+
+### Option 2 — Build from source (Go 1.25+)
+```bash
+go install github.com/dlc-01/relayd/cmd/relayd@latest
+```
+
+### Connect
+```bash
+# start any local service
 python3 -m http.server 8080
 
-# 3. connect to demo server (use credentials from resume)
-relayd client \
+# connect to demo server
+./relayd client \
   --server SERVER_ADDR \
   --token YOUR_TOKEN \
   --tunnel myapp:host:myapp.DOMAIN:127.0.0.1:8080
 ```
+
 
 Your local service is now live at `https://myapp.DOMAIN`
 
 ---
 
 ## How it works
+
 ```
 Internet  ──────────────▶  VPS (relayd server)
                                :80/:443   HTTP/HTTPS routing by Host
@@ -70,6 +98,7 @@ Internet  ──────────────▶  VPS (relayd server)
 ---
 
 ## Tunnel formats
+
 ```bash
 # HTTP routing by Host header
 --tunnel app:host:app.example.com:127.0.0.1:8080
@@ -93,14 +122,13 @@ Internet  ──────────────▶  VPS (relayd server)
 - VPS with public IP (tested on Ubuntu 22.04)
 - Domain pointing to VPS IP
 - Ports open: `80`, `443`, `7000`, `7001`
-- Go 1.22+ (for building)
+- Go 1.25+
 
 ### 1. Get SSL certificate
+
 ```bash
-# install certbot with cloudflare plugin (or any DNS provider)
 apt install certbot python3-certbot-dns-cloudflare
 
-# get wildcard certificate
 certbot certonly \
   --dns-cloudflare \
   --dns-cloudflare-credentials ~/.cloudflare.ini \
@@ -108,24 +136,22 @@ certbot certonly \
   -d "YOUR_DOMAIN"
 ```
 
-Wildcard certificate `*.YOUR_DOMAIN` covers all subdomains automatically — `app.YOUR_DOMAIN`, `api.YOUR_DOMAIN`, etc.
+Wildcard certificate `*.YOUR_DOMAIN` covers all subdomains automatically.
 
 ### 2. Build and deploy server
+
 ```bash
-# clone
 git clone https://github.com/dlc-01/relayd
 cd relayd
 
-# build for linux
 GOOS=linux GOARCH=amd64 go build -o relayd-server ./cmd/server
-
-# copy to VPS
 scp relayd-server root@YOUR_VPS:/opt/relayd/
 ```
 
 ### 3. Create systemd service
 
 `/etc/systemd/system/relayd-server.service`:
+
 ```ini
 [Unit]
 Description=Relayd Server
@@ -139,26 +165,19 @@ ExecStart=/opt/relayd/relayd-server
 Restart=on-failure
 RestartSec=5s
 
-# networking
 Environment=RELAYD_CONTROL_ADDR=0.0.0.0:7000
 Environment=RELAYD_DATA_ADDR=0.0.0.0:7001
 Environment=RELAYD_HTTP_ADDR=0.0.0.0:80
 Environment=RELAYD_TLS_ADDR=0.0.0.0:443
-
-# TLS — wildcard certificate from Let's Encrypt
 Environment=RELAYD_TLS_CERT=/etc/letsencrypt/live/YOUR_DOMAIN/fullchain.pem
 Environment=RELAYD_TLS_KEY=/etc/letsencrypt/live/YOUR_DOMAIN/privkey.pem
 Environment=RELAYD_TLS_DOMAIN=YOUR_DOMAIN
-
-# auth — master token, clients get 24h session tokens automatically
 Environment=RELAYD_TOKEN=YOUR_MASTER_TOKEN
 Environment=RELAYD_SESSION_TTL=24h
-
-# tunnel port range for raw TCP tunnels
 Environment=RELAYD_MIN_PORT=10000
 Environment=RELAYD_MAX_PORT=60000
 
-# optional: telegram notifications on connect/disconnect
+# optional: telegram notifications
 Environment=RELAYD_TG_TOKEN=YOUR_BOT_TOKEN
 Environment=RELAYD_TG_CHAT_ID=YOUR_CHAT_ID
 
@@ -169,6 +188,7 @@ SyslogIdentifier=relayd-server
 [Install]
 WantedBy=multi-user.target
 ```
+
 ```bash
 systemctl daemon-reload
 systemctl enable relayd-server
@@ -176,6 +196,7 @@ systemctl start relayd-server
 ```
 
 ### 4. Open firewall
+
 ```bash
 ufw allow 80/tcp
 ufw allow 443/tcp
@@ -185,20 +206,20 @@ ufw allow 7001/tcp
 ```
 
 ### 5. Verify
+
 ```bash
-# should show: auth enabled, control tls ready, listening on all ports
 journalctl -u relayd-server -o cat | jq '.'
+# should show: auth enabled, control tls ready, listening on all ports
 ```
 
 ### Multiple domains
 
-To serve multiple domains from one server:
 ```bash
-# get second certificate
 certbot certonly --dns-cloudflare -d "*.another.com" -d "another.com"
 ```
+
 ```ini
-# add to systemd service — no code changes needed
+# add to systemd — no code changes needed
 Environment=RELAYD_TLS_DOMAINS=example.com:/etc/letsencrypt/live/example.com/fullchain.pem:/etc/letsencrypt/live/example.com/privkey.pem,another.com:/etc/letsencrypt/live/another.com/fullchain.pem:/etc/letsencrypt/live/another.com/privkey.pem
 ```
 
@@ -207,11 +228,12 @@ Server picks the right certificate by SNI automatically.
 ---
 
 ## CLI
+
 ```bash
 # install
 go install github.com/dlc-01/relayd/cmd/relayd@latest
 
-# client — connect to server
+# client
 relayd client \
   --server YOUR_VPS:7000 \
   --token YOUR_TOKEN \
@@ -229,17 +251,14 @@ relayd server --token SECRET --tg-token BOT_TOKEN --tg-chat CHAT_ID
 
 # token management (run on VPS)
 relayd token issue --master SECRET --label vasya --ttl 24h
-# token:      a3f9b2c1...
-# expires_at: 2026-03-29T12:00:00Z
-
-relayd token list   --master SECRET
-relayd token revoke a3f9b2c1 --master SECRET
+relayd token list  --master SECRET
+relayd token revoke TOKEN --master SECRET
 
 # version
 relayd version
 ```
 
-All flags have env variable fallbacks — you can use either flags or env vars.
+All flags have env variable fallbacks.
 
 ---
 
@@ -275,13 +294,39 @@ All flags have env variable fallbacks — you can use either flags or env vars.
 ## Security
 
 - **TLS** — all client↔server traffic is encrypted
-- **Certificate pinning** — client pins server cert on first connect, rejects mismatch (MITM protection)
+- **Certificate pinning** — client pins server certificate on first connect (TOFU model)
 - **Token auth** — master token stays local, server issues short-lived 24h session tokens
 - **Admin API** — bound to `127.0.0.1:7002`, not accessible from outside
 
 ---
 
+## Benchmarks
+
+Measured on MacBook Air M2 (2022), 16GB, macOS Sequoia 15.3.1, Go 1.25, `go test -bench=. -benchmem -benchtime=5s`.
+
+| Benchmark | ops/s | ns/op | throughput | allocs/op |
+|-----------|------:|------:|------------|----------:|
+| Tunnel_Throughput | 78 806 | 76 059 | **53.85 MB/s** | 2 |
+| Tunnel_Latency | 91 076 | 67 396 | ~0.07ms RTT | 2 |
+| Tunnel_ConcurrentConns | 188 319 | 30 358 | — | 2 |
+| Server_HTTPRouting | 57 111 | 110 701 | — | 69 |
+| Server_Register | 9 303 | 781 251 | — | 1165 |
+| Server_HostLookup (100 tunnels) | 59 667 | 103 225 | — | 69 |
+
+CPU profile: 98% syscalls (network IO + TLS) — application code is not the bottleneck.
+
+Notable:
+- ~54 MB/s through double TLS (client→server→backend)
+- ~0.07ms round-trip latency
+- Concurrent connections 2x faster than single — goroutine scheduler works efficiently
+- Host lookup with 100 active tunnels same speed as 1 — O(1) map lookup
+- Register dominated by TLS handshake — expected
+
+Benchmarks are local measurements and mainly reflect relative overhead of the implementation.
+---
+
 ## Project structure
+
 ```
 relayd/
 ├── cmd/
@@ -309,6 +354,7 @@ relayd/
 ---
 
 ## Development
+
 ```bash
 # run tests
 go test ./... -race
@@ -327,8 +373,8 @@ go run ./cmd/client
 
 ## CI/CD
 
-GitHub Actions workflow on every push:
-- runs `go test ./... -race`
+GitHub Actions on every push:
+- `go test ./... -race`
 - builds binaries for linux/amd64
 - deploys to VPS on push to `main` (atomic swap — no downtime)
 
@@ -338,7 +384,6 @@ Required secrets: `SSH_PRIVATE_KEY`, `SSH_HOST`, `SSH_USER`, `TLS_DOMAIN`, `RELA
 
 ## Roadmap
 
-- [ ] Benchmarks + fault scenario tests
 - [ ] UDP tunnels
 - [ ] QUIC transport
 - [ ] HTTP/3 public listener

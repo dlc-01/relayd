@@ -18,11 +18,30 @@ import (
 
 var insecureTLS = &tls.Config{InsecureSkipVerify: true}
 
-func freeAddr(t *testing.T) string {
-	t.Helper()
+func serverConfig(tb testing.TB, masterToken string, sessionTTL time.Duration, dir string) config.ServerConfig {
+	tb.Helper()
+	return config.ServerConfig{
+		ControlAddr:     freeAddrTB(tb),
+		DataAddr:        freeAddrTB(tb),
+		HTTPAddr:        freeAddrTB(tb),
+		TLSAddr:         freeAddrTB(tb),
+		TLSDomain:       "example.com",
+		ControlCertFile: filepath.Join(dir, "control.crt"),
+		ControlKeyFile:  filepath.Join(dir, "control.key"),
+		MinPublicPort:   1024,
+		MaxPublicPort:   65535,
+		PendingTimeout:  30 * time.Second,
+		MasterToken:     masterToken,
+		SessionTTL:      sessionTTL,
+		Dev:             true,
+	}
+}
+
+func freeAddrTB(tb testing.TB) string {
+	tb.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	addr := ln.Addr().String()
 	ln.Close()
@@ -42,20 +61,13 @@ func freePort(t *testing.T) int {
 
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
+	return newTestServerWithToken(t, "", 0)
+}
+
+func newTestServerWithToken(t *testing.T, masterToken string, sessionTTL time.Duration) *Server {
+	t.Helper()
 	dir := t.TempDir()
-	cfg := config.ServerConfig{
-		ControlAddr:     freeAddr(t),
-		DataAddr:        freeAddr(t),
-		HTTPAddr:        freeAddr(t),
-		TLSAddr:         freeAddr(t),
-		TLSDomain:       "example.com",
-		ControlCertFile: filepath.Join(dir, "control.crt"),
-		ControlKeyFile:  filepath.Join(dir, "control.key"),
-		MinPublicPort:   1024,
-		MaxPublicPort:   65535,
-		PendingTimeout:  30 * time.Second,
-		Dev:             true,
-	}
+	cfg := serverConfig(t, masterToken, sessionTTL, dir)
 	s := New(cfg)
 	go s.listenControl()
 	go s.listenData()
@@ -615,10 +627,10 @@ func TestServer_Heartbeat(t *testing.T) {
 func TestServer_PendingTimeout(t *testing.T) {
 	dir := t.TempDir()
 	cfg := config.ServerConfig{
-		ControlAddr:     freeAddr(t),
-		DataAddr:        freeAddr(t),
-		HTTPAddr:        freeAddr(t),
-		TLSAddr:         freeAddr(t),
+		ControlAddr:     freeAddrTB(t),
+		DataAddr:        freeAddrTB(t),
+		HTTPAddr:        freeAddrTB(t),
+		TLSAddr:         freeAddrTB(t),
 		TLSDomain:       "example.com",
 		ControlCertFile: filepath.Join(dir, "control.crt"),
 		ControlKeyFile:  filepath.Join(dir, "control.key"),
@@ -660,28 +672,7 @@ func TestServer_PendingTimeout(t *testing.T) {
 	}
 }
 func TestServer_Auth_NoToken(t *testing.T) {
-	dir := t.TempDir()
-	cfg := config.ServerConfig{
-		ControlAddr:     freeAddr(t),
-		DataAddr:        freeAddr(t),
-		HTTPAddr:        freeAddr(t),
-		TLSAddr:         freeAddr(t),
-		TLSDomain:       "example.com",
-		ControlCertFile: filepath.Join(dir, "control.crt"),
-		ControlKeyFile:  filepath.Join(dir, "control.key"),
-		MinPublicPort:   1024,
-		MaxPublicPort:   65535,
-		PendingTimeout:  30 * time.Second,
-		MasterToken:     "master-secret",
-		SessionTTL:      time.Hour,
-		Dev:             true,
-	}
-	s := New(cfg)
-	go s.listenControl()
-	go s.listenData()
-	go s.listenHTTP()
-	go s.listenTLS()
-	time.Sleep(50 * time.Millisecond)
+	s := newTestServerWithToken(t, "master-secret", time.Hour)
 
 	ctrl := dialControl(t, s)
 	defer ctrl.Close()
@@ -698,28 +689,7 @@ func TestServer_Auth_NoToken(t *testing.T) {
 }
 
 func TestServer_Auth_WrongToken(t *testing.T) {
-	dir := t.TempDir()
-	cfg := config.ServerConfig{
-		ControlAddr:     freeAddr(t),
-		DataAddr:        freeAddr(t),
-		HTTPAddr:        freeAddr(t),
-		TLSAddr:         freeAddr(t),
-		TLSDomain:       "example.com",
-		ControlCertFile: filepath.Join(dir, "control.crt"),
-		ControlKeyFile:  filepath.Join(dir, "control.key"),
-		MinPublicPort:   1024,
-		MaxPublicPort:   65535,
-		PendingTimeout:  30 * time.Second,
-		MasterToken:     "master-secret",
-		SessionTTL:      time.Hour,
-		Dev:             true,
-	}
-	s := New(cfg)
-	go s.listenControl()
-	go s.listenData()
-	go s.listenHTTP()
-	go s.listenTLS()
-	time.Sleep(50 * time.Millisecond)
+	s := newTestServerWithToken(t, "master-secret", time.Hour)
 
 	ctrl := dialControl(t, s)
 	defer ctrl.Close()
@@ -737,28 +707,7 @@ func TestServer_Auth_WrongToken(t *testing.T) {
 }
 
 func TestServer_Auth_MasterToken_IssuesTempToken(t *testing.T) {
-	dir := t.TempDir()
-	cfg := config.ServerConfig{
-		ControlAddr:     freeAddr(t),
-		DataAddr:        freeAddr(t),
-		HTTPAddr:        freeAddr(t),
-		TLSAddr:         freeAddr(t),
-		TLSDomain:       "example.com",
-		ControlCertFile: filepath.Join(dir, "control.crt"),
-		ControlKeyFile:  filepath.Join(dir, "control.key"),
-		MinPublicPort:   1024,
-		MaxPublicPort:   65535,
-		PendingTimeout:  30 * time.Second,
-		MasterToken:     "master-secret",
-		SessionTTL:      time.Hour,
-		Dev:             true,
-	}
-	s := New(cfg)
-	go s.listenControl()
-	go s.listenData()
-	go s.listenHTTP()
-	go s.listenTLS()
-	time.Sleep(50 * time.Millisecond)
+	s := newTestServerWithToken(t, "master-secret", time.Hour)
 
 	ctrl := dialControl(t, s)
 	defer ctrl.Close()
@@ -785,28 +734,7 @@ func TestServer_Auth_MasterToken_IssuesTempToken(t *testing.T) {
 }
 
 func TestServer_Auth_TempToken_Works(t *testing.T) {
-	dir := t.TempDir()
-	cfg := config.ServerConfig{
-		ControlAddr:     freeAddr(t),
-		DataAddr:        freeAddr(t),
-		HTTPAddr:        freeAddr(t),
-		TLSAddr:         freeAddr(t),
-		TLSDomain:       "example.com",
-		ControlCertFile: filepath.Join(dir, "control.crt"),
-		ControlKeyFile:  filepath.Join(dir, "control.key"),
-		MinPublicPort:   1024,
-		MaxPublicPort:   65535,
-		PendingTimeout:  30 * time.Second,
-		MasterToken:     "master-secret",
-		SessionTTL:      time.Hour,
-		Dev:             true,
-	}
-	s := New(cfg)
-	go s.listenControl()
-	go s.listenData()
-	go s.listenHTTP()
-	go s.listenTLS()
-	time.Sleep(50 * time.Millisecond)
+	s := newTestServerWithToken(t, "master-secret", time.Hour)
 
 	ctrl1 := dialControl(t, s)
 	proto.Write(ctrl1, proto.Message{
@@ -841,49 +769,8 @@ func TestServer_Auth_TempToken_Works(t *testing.T) {
 	}
 }
 
-func TestServer_Auth_Disabled_NoTokenRequired(t *testing.T) {
-	s := newTestServer(t)
-
-	ctrl := dialControl(t, s)
-	defer ctrl.Close()
-
-	proto.Write(ctrl, proto.Message{
-		Type:    proto.TypeRegister,
-		Tunnels: []proto.TunnelDef{{TunnelID: "web", Host: "app.example.com"}},
-	})
-
-	msg, err := proto.Read(ctrl)
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	if msg.Type != proto.TypeOK {
-		t.Errorf("expected ok without auth, got %s reason=%s", msg.Type, msg.Reason)
-	}
-}
-
 func TestServer_Auth_ExpiredTempToken(t *testing.T) {
-	dir := t.TempDir()
-	cfg := config.ServerConfig{
-		ControlAddr:     freeAddr(t),
-		DataAddr:        freeAddr(t),
-		HTTPAddr:        freeAddr(t),
-		TLSAddr:         freeAddr(t),
-		TLSDomain:       "example.com",
-		ControlCertFile: filepath.Join(dir, "control.crt"),
-		ControlKeyFile:  filepath.Join(dir, "control.key"),
-		MinPublicPort:   1024,
-		MaxPublicPort:   65535,
-		PendingTimeout:  30 * time.Second,
-		MasterToken:     "master-secret",
-		SessionTTL:      20 * time.Millisecond,
-		Dev:             true,
-	}
-	s := New(cfg)
-	go s.listenControl()
-	go s.listenData()
-	go s.listenHTTP()
-	go s.listenTLS()
-	time.Sleep(50 * time.Millisecond)
+	s := newTestServerWithToken(t, "master-secret", 20*time.Millisecond)
 
 	ctrl1 := dialControl(t, s)
 	proto.Write(ctrl1, proto.Message{
@@ -907,5 +794,25 @@ func TestServer_Auth_ExpiredTempToken(t *testing.T) {
 	msg2, _ := proto.Read(ctrl2)
 	if msg2.Type != proto.TypeError {
 		t.Errorf("expected error for expired token, got %s", msg2.Type)
+	}
+}
+
+func TestServer_Auth_Disabled_NoTokenRequired(t *testing.T) {
+	s := newTestServer(t)
+
+	ctrl := dialControl(t, s)
+	defer ctrl.Close()
+
+	proto.Write(ctrl, proto.Message{
+		Type:    proto.TypeRegister,
+		Tunnels: []proto.TunnelDef{{TunnelID: "web", Host: "app.example.com"}},
+	})
+
+	msg, err := proto.Read(ctrl)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if msg.Type != proto.TypeOK {
+		t.Errorf("expected ok without auth, got %s reason=%s", msg.Type, msg.Reason)
 	}
 }
