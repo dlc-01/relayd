@@ -39,6 +39,9 @@ jobs:
       - name: Build client
         run: GOOS=linux GOARCH=amd64 go build -o relayd-client ./cmd/client
 
+      - name: Build relayd CLI
+        run: GOOS=linux GOARCH=amd64 go build -ldflags="-X github.com/dlc-01/relayd/cmd/relayd/cmd.Version=$(git describe --tags --always --dirty)" -o relayd ./cmd/relayd
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -46,6 +49,7 @@ jobs:
           path: |
             relayd-server
             relayd-client
+            relayd
 
   deploy:
     name: Deploy
@@ -69,8 +73,15 @@ jobs:
       - name: Build server for linux
         run: GOOS=linux GOARCH=amd64 go build -o relayd-server ./cmd/server
 
-      - name: Check binary exists
-        run: ls -la relayd-server
+      - name: Build relayd CLI
+        run: |
+          GOOS=linux GOARCH=amd64 go build \
+            -ldflags="-X github.com/dlc-01/relayd/cmd/relayd/cmd.Version=$(git describe --tags --always --dirty)" \
+            -o relayd \
+            ./cmd/relayd
+
+      - name: Check binaries exist
+        run: ls -la relayd-server relayd
 
       - name: Setup SSH
         run: |
@@ -79,21 +90,24 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
 
-      - name: Copy binary to VPS
+      - name: Copy binaries to VPS
         run: |
-            ssh -i ~/.ssh/deploy_key ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
-              "mkdir -p /opt/relayd && chmod 755 /opt/relayd"
-            scp -i ~/.ssh/deploy_key \
-              relayd-server \
-              ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/opt/relayd/relayd-server.new
-            ssh -i ~/.ssh/deploy_key ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
-              "mv /opt/relayd/relayd-server.new /opt/relayd/relayd-server && chmod +x /opt/relayd/relayd-server"
+          ssh -i ~/.ssh/deploy_key ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "mkdir -p /opt/relayd && chmod 755 /opt/relayd"
+          scp -i ~/.ssh/deploy_key \
+            relayd-server \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/opt/relayd/relayd-server.new
+          scp -i ~/.ssh/deploy_key \
+            relayd \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/opt/relayd/relayd.new
+          ssh -i ~/.ssh/deploy_key ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "mv /opt/relayd/relayd-server.new /opt/relayd/relayd-server && \
+             mv /opt/relayd/relayd.new /opt/relayd/relayd && \
+             chmod +x /opt/relayd/relayd-server /opt/relayd/relayd"
 
       - name: Update systemd and restart
         run: |
           ssh -i ~/.ssh/deploy_key ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} bash << 'EOF'
-            chmod +x /opt/relayd/relayd-server
-
             cat > /etc/systemd/system/relayd-server.service << 'UNIT'
           [Unit]
           Description=Relayd Server
