@@ -48,7 +48,8 @@ python3 -m http.server 8080
 
 # connect to demo server
 ./relayd client \
-  --server SERVER_ADDR \
+  --server SERVER_ADDR:7000 \
+  --data SERVER_ADDR:7001 \
   --token YOUR_TOKEN \
   --tunnel myapp:host:myapp.DOMAIN:127.0.0.1:8080
 ```
@@ -236,6 +237,7 @@ go install github.com/dlc-01/relayd/cmd/relayd@latest
 # client
 relayd client \
   --server YOUR_VPS:7000 \
+  --data YOUR_VPS:7001 \
   --token YOUR_TOKEN \
   --tunnel app:host:app.YOUR_DOMAIN:127.0.0.1:8080
 

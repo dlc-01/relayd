@@ -30,6 +30,8 @@ func runClient(cmd *cobra.Command, args []string) error {
 	bindEnv(cmd, "session-file", "RELAYD_SESSION_FILE")
 	bindEnvBool(cmd, "dev", "RELAYD_DEV")
 
+	inferDataAddr(cmd)
+
 	if tunnels, _ := cmd.Flags().GetStringArray("tunnel"); len(tunnels) > 0 {
 		bindTunnels(tunnels)
 	}
