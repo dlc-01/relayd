@@ -51,27 +51,6 @@ jobs:
             relayd-client
             relayd
 
-      - name: Build relayd CLI (linux/amd64)
-        run: GOOS=linux GOARCH=amd64 go build -ldflags="..." -o relayd-linux-amd64 ./cmd/relayd
-
-      - name: Build relayd CLI (darwin/arm64)
-        run: GOOS=darwin GOARCH=arm64 go build -ldflags="..." -o relayd-darwin-arm64 ./cmd/relayd
-
-      - name: Build relayd CLI (darwin/amd64)
-        run: GOOS=darwin GOARCH=amd64 go build -ldflags="..." -o relayd-darwin-amd64 ./cmd/relayd
-
-      - name: Build relayd CLI (windows/amd64)
-        run: GOOS=windows GOARCH=amd64 go build -ldflags="..." -o relayd-windows-amd64.exe ./cmd/relayd
-
-      - name: Create Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v1
-        with:
-          files: |
-            relayd-linux-amd64
-            relayd-darwin-arm64
-            relayd-darwin-amd64
-            relayd-windows-amd64.exe
 
   deploy:
     name: Deploy
@@ -127,6 +106,27 @@ jobs:
              mv /opt/relayd/relayd.new /opt/relayd/relayd && \
              chmod +x /opt/relayd/relayd-server /opt/relayd/relayd"
 
+      - name: Build relayd CLI (linux/amd64)
+        run: GOOS=linux GOARCH=amd64 go build -ldflags="..." -o relayd-linux-amd64 ./cmd/relayd
+
+      - name: Build relayd CLI (darwin/arm64)
+        run: GOOS=darwin GOARCH=arm64 go build -ldflags="..." -o relayd-darwin-arm64 ./cmd/relayd
+
+      - name: Build relayd CLI (darwin/amd64)
+        run: GOOS=darwin GOARCH=amd64 go build -ldflags="..." -o relayd-darwin-amd64 ./cmd/relayd
+
+      - name: Build relayd CLI (windows/amd64)
+        run: GOOS=windows GOARCH=amd64 go build -ldflags="..." -o relayd-windows-amd64.exe ./cmd/relayd
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            relayd-linux-amd64
+            relayd-darwin-arm64
+            relayd-darwin-amd64
+            relayd-windows-amd64.exe
       - name: Update systemd and restart
         run: |
           ssh -i ~/.ssh/deploy_key ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} bash << 'EOF'
