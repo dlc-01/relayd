@@ -388,6 +388,48 @@ GitHub Actions on every push:
 
 Required secrets: `SSH_PRIVATE_KEY`, `SSH_HOST`, `SSH_USER`, `TLS_DOMAIN`, `RELAYD_TOKEN`, `RELAYD_TG_TOKEN`, `RELAYD_TG_CHAT_ID`
 
+## Observability
+
+### Health check
+```bash
+curl http://localhost:7002/health
+```
+```json
+{
+  "status": "ok",
+  "sessions": 2,
+  "tunnels": 3,
+  "uptime": "2h15m30s",
+  "version": "v0.2.0"
+}
+```
+
+No authentication required.
+
+### Metrics (Prometheus)
+```bash
+curl http://localhost:7002/metrics
+```
+```
+relayd_active_sessions 2
+relayd_active_tunnels 3
+relayd_connections_total 47
+relayd_auth_failures_total 1
+relayd_rate_limit_hits_total 0
+relayd_bytes_proxied_total 1.234567e+06
+```
+
+No authentication required. Add to your `prometheus.yml`:
+```yaml
+scrape_configs:
+  - job_name: relayd
+    static_configs:
+      - targets: ['YOUR_VPS:7002']
+```
+
+> Note: port 7002 is bound to `127.0.0.1` by default.
+> To expose metrics externally use SSH tunnel or change `RELAYD_ADMIN_ADDR`.
+
 ---
 
 ## Roadmap
