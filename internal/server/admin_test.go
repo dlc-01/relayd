@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dlc-01/relayd/internal/auth"
 	"github.com/dlc-01/relayd/internal/config"
 )
 
@@ -392,11 +391,77 @@ func TestAdmin_NewManagerWithAuth(t *testing.T) {
 	}
 }
 
-func newTestAuthManager(t *testing.T) *auth.Manager {
-	t.Helper()
-	m, err := auth.NewManager("master-secret", time.Hour)
-	if err != nil {
-		t.Fatal(err)
+func TestHandleHealth_OK(t *testing.T) {
+	s := newTestServerWithAuth(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	w := httptest.NewRecorder()
+
+	s.handleHealth(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
 	}
-	return m
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp["status"] != "ok" {
+		t.Errorf("expected status ok, got %v", resp["status"])
+	}
+	if resp["version"] == "" {
+		t.Error("expected non-empty version")
+	}
+	if resp["uptime"] == "" {
+		t.Error("expected non-empty uptime")
+	}
+}
+
+func TestHandleHealth_NoAuth(t *testing.T) {
+	s := newTestServerWithAuth(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	w := httptest.NewRecorder()
+
+	// health должен работать без auth
+	s.routeAdmin(http.HandlerFunc(s.handleHealth)).ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 without auth, got %d", w.Code)
+	}
+}
+
+func TestRouteAdmin_HealthPublic(t *testing.T) {
+	s := newTestServerWithAuth(t)
+
+	for _, path := range []string{"/health", "/metrics"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		w := httptest.NewRecorder()
+
+		called := false
+		s.routeAdmin(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			called = true
+			w.WriteHeader(http.StatusOK)
+		})).ServeHTTP(w, req)
+
+		if !called {
+			t.Errorf("expected handler called for %s without auth", path)
+		}
+	}
+}
+
+func TestRouteAdmin_TokenProtected(t *testing.T) {
+	s := newTestServerWithAuth(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/token/list", nil)
+	w := httptest.NewRecorder()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/token/list", s.handleTokenList)
+	s.routeAdmin(mux).ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for /token/list without auth, got %d", w.Code)
+	}
 }

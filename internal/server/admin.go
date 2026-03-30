@@ -5,23 +5,36 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func (s *Server) ListenAdmin() {
-	if s.auth == nil {
-		s.log.Warnw("admin api disabled — auth not configured")
-		return
-	}
-
 	mux := http.NewServeMux()
-	mux.HandleFunc("/token/issue", s.handleTokenIssue)
-	mux.HandleFunc("/token/list", s.handleTokenList)
-	mux.HandleFunc("/token/revoke", s.handleTokenRevoke)
+
+	mux.HandleFunc("/health", s.handleHealth)
+	mux.Handle("/metrics", promhttp.Handler())
+
+	if s.auth != nil {
+		mux.HandleFunc("/token/issue", s.handleTokenIssue)
+		mux.HandleFunc("/token/list", s.handleTokenList)
+		mux.HandleFunc("/token/revoke", s.handleTokenRevoke)
+	}
 
 	s.log.Infow("admin listening", "addr", s.cfg.AdminAddr)
-	if err := http.ListenAndServe(s.cfg.AdminAddr, s.adminAuth(mux)); err != nil {
+	if err := http.ListenAndServe(s.cfg.AdminAddr, s.routeAdmin(mux)); err != nil {
 		s.log.Errorw("admin server failed", "err", err)
 	}
+}
+
+func (s *Server) routeAdmin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" || r.URL.Path == "/metrics" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		s.adminAuth(next).ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) adminAuth(next http.Handler) http.Handler {

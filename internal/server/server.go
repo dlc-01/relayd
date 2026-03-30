@@ -20,6 +20,7 @@ import (
 	"github.com/dlc-01/relayd/internal/portcheck"
 	"github.com/dlc-01/relayd/internal/proto"
 	"github.com/dlc-01/relayd/internal/ratelimit"
+	"github.com/dlc-01/relayd/internal/server/metrics"
 	"github.com/dlc-01/relayd/internal/tlscerts"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -178,6 +179,7 @@ func (s *Server) authAndIssue(token, remote string) (tempToken string, expiresAt
 
 	entry, err := s.auth.Validate(token)
 	if err != nil {
+		metrics.AuthFailuresTotal.Inc()
 		s.notify.InvalidToken(remote)
 		return "", "", err
 	}
@@ -252,6 +254,7 @@ func (s *Server) checkRateLimit(ctrl net.Conn, remote string) error {
 		return nil
 	}
 	if !s.limiter.Allow(remote) {
+		metrics.RateLimitHitsTotal.Inc()
 		s.log.Warnw("rate limit exceeded", "remote", remote)
 		proto.Write(ctrl, proto.Message{Type: proto.TypeError, Reason: "rate limit exceeded"})
 		return fmt.Errorf("rate limit exceeded")
@@ -261,7 +264,6 @@ func (s *Server) checkRateLimit(ctrl net.Conn, remote string) error {
 		proto.Write(ctrl, proto.Message{Type: proto.TypeError, Reason: "too many connections"})
 		return fmt.Errorf("too many connections")
 	}
-	// ConnClose вызывается в removeSession через defer
 	return nil
 }
 
@@ -394,6 +396,11 @@ func (s *Server) registerSession(ctrl net.Conn, remote string, tunnels []proto.T
 			"aliases", t.Hosts,
 		)
 	}
+
+	metrics.ActiveSessions.Inc()
+	metrics.ActiveTunnels.Add(float64(len(tunnels)))
+	metrics.ConnectionsTotal.Inc()
+
 	return session, nil
 }
 
@@ -482,6 +489,9 @@ func (s *Server) removeSession(session *clientSession) {
 			"tunnel_id", t.TunnelID,
 		)
 	}
+
+	metrics.ActiveSessions.Dec()
+	metrics.ActiveTunnels.Sub(float64(len(session.tunnels)))
 }
 
 func (s *Server) listenData() {
@@ -749,7 +759,15 @@ func bridge(a, b net.Conn) {
 	defer a.Close()
 	defer b.Close()
 	done := make(chan struct{}, 2)
-	go func() { io.Copy(a, b); done <- struct{}{} }()
-	go func() { io.Copy(b, a); done <- struct{}{} }()
+	go func() {
+		n, _ := io.Copy(a, b)
+		metrics.BytesProxiedTotal.Add(float64(n))
+		done <- struct{}{}
+	}()
+	go func() {
+		n, _ := io.Copy(b, a)
+		metrics.BytesProxiedTotal.Add(float64(n))
+		done <- struct{}{}
+	}()
 	<-done
 }
