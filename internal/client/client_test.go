@@ -515,7 +515,7 @@ func TestClient_Auth_UsesSessionFile(t *testing.T) {
 		t.Fatal("expected session saved after first connect")
 	}
 
-	token := c.activeToken()
+	token, _ := c.activeToken()
 	if token != s.TempToken {
 		t.Errorf("expected activeToken to return temp token, got %s", token)
 	}
@@ -539,7 +539,7 @@ func TestClient_Auth_ExpiredSession_FallsBackToMaster(t *testing.T) {
 	}
 
 	c := New(cfg)
-	token := c.activeToken()
+	token, _ := c.activeToken()
 
 	if token != "master-secret" {
 		t.Errorf("expected master token after expired session, got %s", token)

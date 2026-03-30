@@ -51,7 +51,8 @@ func New(cfg config.ClientConfig) *Client {
 }
 
 type authError struct {
-	reason string
+	reason    string
+	fromCache bool
 }
 
 func (e *authError) Error() string {
@@ -65,7 +66,18 @@ func (c *Client) Run() {
 		if err != nil {
 			var ae *authError
 			if errors.As(err, &ae) {
-				c.log.Fatalw("authentication failed, check your token", "reason", ae.reason)
+				if ae.fromCache {
+					c.log.Warnw("saved session rejected, clearing and retrying with master token",
+						"reason", ae.reason,
+					)
+					session.Delete(c.cfg.SessionFile)
+					backoff = c.reconnectInitial
+					continue
+				}
+				c.log.Fatalw("authentication failed",
+					"reason", ae.reason,
+					"hint", "check your token value or remove ~/.relayd/server.pin if server changed",
+				)
 			}
 			c.log.Warnw("connection failed, reconnecting",
 				"err", err,
@@ -75,6 +87,8 @@ func (c *Client) Run() {
 			c.log.Warnw("disconnected, reconnecting",
 				"backoff", backoff,
 			)
+			backoff = c.reconnectInitial
+			continue
 		}
 		time.Sleep(backoff)
 		backoff *= 2
@@ -84,17 +98,17 @@ func (c *Client) Run() {
 	}
 }
 
-func (c *Client) activeToken() string {
+func (c *Client) activeToken() (token string, fromCache bool) {
 	if session.Exists(c.cfg.SessionFile) {
 		s, err := session.Load(c.cfg.SessionFile)
 		if err == nil && !s.IsExpired() {
 			c.log.Debugw("using saved session", "label", s.Label, "expires_at", s.ExpiresAt)
-			return s.TempToken
+			return s.TempToken, true
 		}
 		c.log.Infow("session expired, will re-authenticate with master token")
 		session.Delete(c.cfg.SessionFile)
 	}
-	return c.cfg.Token
+	return c.cfg.Token, false
 }
 
 func (c *Client) connect() error {
@@ -115,10 +129,10 @@ func (c *Client) connect() error {
 	defer ctrl.Close()
 
 	if err := c.verifyAndPin(ctrl); err != nil {
-		return fmt.Errorf("pin verification failed: %w", err)
+		return fmt.Errorf("pin verification failed: %w\nhint: if server certificate changed, remove %s", err, c.cfg.PinFile)
 	}
 
-	token := c.activeToken()
+	token, fromCache := c.activeToken()
 
 	var defs []proto.TunnelDef
 	for _, t := range c.cfg.Tunnels {
@@ -143,13 +157,14 @@ func (c *Client) connect() error {
 	if err != nil {
 		return err
 	}
+
 	if msg.Type == proto.TypeError {
-		if msg.Reason == "token expired" {
-			c.log.Warnw("session expired, deleting session file")
-			session.Delete(c.cfg.SessionFile)
+		return &authError{
+			reason:    msg.Reason,
+			fromCache: fromCache,
 		}
-		return &authError{reason: msg.Reason}
 	}
+
 	if msg.Type != proto.TypeOK {
 		return fmt.Errorf("unexpected register response: %s", msg.Type)
 	}
@@ -167,9 +182,7 @@ func (c *Client) connect() error {
 		if err := session.Save(c.cfg.SessionFile, s); err != nil {
 			c.log.Warnw("failed to save session", "err", err)
 		} else {
-			c.log.Infow("session saved",
-				"expires_at", expiresAt.Format(time.RFC3339),
-			)
+			c.log.Infow("session saved", "expires_at", expiresAt.Format(time.RFC3339))
 		}
 	}
 
@@ -236,7 +249,10 @@ func (c *Client) verifyAndPin(conn *tls.Conn) error {
 	}
 
 	if fp != saved {
-		return fmt.Errorf("certificate fingerprint mismatch: got %s, want %s (possible MITM)", fp, saved)
+		return fmt.Errorf(
+			"certificate fingerprint mismatch\ngot:  %s\nwant: %s\nif server changed intentionally, remove: %s",
+			fp, saved, c.cfg.PinFile,
+		)
 	}
 
 	c.log.Debugw("certificate pin verified", "fingerprint", fp)
@@ -267,10 +283,7 @@ func (c *Client) heartbeat(ctrl net.Conn, done chan struct{}) {
 func (c *Client) handleConnect(connID, tunnelID string) {
 	localAddr, ok := c.tunnels[tunnelID]
 	if !ok {
-		c.log.Warnw("unknown tunnel_id",
-			"tunnel_id", tunnelID,
-			"conn_id", connID,
-		)
+		c.log.Warnw("unknown tunnel_id", "tunnel_id", tunnelID, "conn_id", connID)
 		return
 	}
 
@@ -293,10 +306,7 @@ func (c *Client) handleConnect(connID, tunnelID string) {
 		tlsCfg,
 	)
 	if err != nil {
-		c.log.Errorw("dial data failed",
-			"conn_id", connID,
-			"err", err,
-		)
+		c.log.Errorw("dial data failed", "conn_id", connID, "err", err)
 		localConn.Close()
 		return
 	}
@@ -305,10 +315,7 @@ func (c *Client) handleConnect(connID, tunnelID string) {
 		Type:   proto.TypeData,
 		ConnID: connID,
 	}); err != nil {
-		c.log.Errorw("send data msg failed",
-			"conn_id", connID,
-			"err", err,
-		)
+		c.log.Errorw("send data msg failed", "conn_id", connID, "err", err)
 		localConn.Close()
 		dataConn.Close()
 		return
@@ -320,11 +327,9 @@ func (c *Client) handleConnect(connID, tunnelID string) {
 		"local_addr", localAddr,
 	)
 	bridge(localConn, dataConn)
-	c.log.Debugw("bridge closed",
-		"conn_id", connID,
-		"tunnel_id", tunnelID,
-	)
+	c.log.Debugw("bridge closed", "conn_id", connID, "tunnel_id", tunnelID)
 }
+
 func bridge(a, b net.Conn) {
 	defer a.Close()
 	defer b.Close()
