@@ -132,6 +132,7 @@ func (c *Client) connect() error {
 
 	if err := proto.Write(ctrl, proto.Message{
 		Type:    proto.TypeRegister,
+		Version: proto.Version,
 		Token:   token,
 		Tunnels: defs,
 	}); err != nil {

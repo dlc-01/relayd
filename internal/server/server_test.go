@@ -816,3 +816,172 @@ func TestServer_Auth_Disabled_NoTokenRequired(t *testing.T) {
 		t.Errorf("expected ok without auth, got %s reason=%s", msg.Type, msg.Reason)
 	}
 }
+func TestServer_RateLimit_Exceeded(t *testing.T) {
+	dir := t.TempDir()
+	cfg := serverConfig(t, "", 0, dir)
+	cfg.RateLimit = 2
+	cfg.RateLimitWindow = time.Second
+	cfg.MaxConnsPerIP = 10
+	s := New(cfg)
+	go s.listenControl()
+	go s.listenData()
+	go s.listenHTTP()
+	go s.listenTLS()
+	time.Sleep(50 * time.Millisecond)
+
+	for i := 0; i < 2; i++ {
+		ctrl := dialControl(t, s)
+		proto.Write(ctrl, proto.Message{
+			Type:    proto.TypeRegister,
+			Tunnels: []proto.TunnelDef{{TunnelID: fmt.Sprintf("t%d", i), Host: fmt.Sprintf("t%d.example.com", i)}},
+		})
+		proto.Read(ctrl)
+		ctrl.Close()
+	}
+
+	ctrl := dialControl(t, s)
+	defer ctrl.Close()
+	proto.Write(ctrl, proto.Message{
+		Type:    proto.TypeRegister,
+		Tunnels: []proto.TunnelDef{{TunnelID: "t3", Host: "t3.example.com"}},
+	})
+
+	msg, _ := proto.Read(ctrl)
+	if msg.Type != proto.TypeError {
+		t.Errorf("expected rate limit error, got %s", msg.Type)
+	}
+	if !strings.Contains(msg.Reason, "rate limit") {
+		t.Errorf("unexpected reason: %s", msg.Reason)
+	}
+}
+
+func TestServer_MaxConnsPerIP(t *testing.T) {
+	dir := t.TempDir()
+	cfg := serverConfig(t, "", 0, dir)
+	cfg.RateLimit = 1000
+	cfg.RateLimitWindow = time.Second
+	cfg.MaxConnsPerIP = 1
+	s := New(cfg)
+	go s.listenControl()
+	go s.listenData()
+	go s.listenHTTP()
+	go s.listenTLS()
+	time.Sleep(50 * time.Millisecond)
+
+	ctrl1 := dialControl(t, s)
+	defer ctrl1.Close()
+	proto.Write(ctrl1, proto.Message{
+		Type:    proto.TypeRegister,
+		Tunnels: []proto.TunnelDef{{TunnelID: "t1", Host: "t1.example.com"}},
+	})
+	proto.Read(ctrl1)
+
+	ctrl2 := dialControl(t, s)
+	defer ctrl2.Close()
+	proto.Write(ctrl2, proto.Message{
+		Type:    proto.TypeRegister,
+		Tunnels: []proto.TunnelDef{{TunnelID: "t2", Host: "t2.example.com"}},
+	})
+
+	msg, _ := proto.Read(ctrl2)
+	if msg.Type != proto.TypeError {
+		t.Errorf("expected max conns error, got %s", msg.Type)
+	}
+	if !strings.Contains(msg.Reason, "too many connections") {
+		t.Errorf("unexpected reason: %s", msg.Reason)
+	}
+}
+
+func TestServer_ProtocolVersion_Mismatch(t *testing.T) {
+	s := newTestServer(t)
+
+	ctrl := dialControl(t, s)
+	defer ctrl.Close()
+
+	proto.Write(ctrl, proto.Message{
+		Type:    proto.TypeRegister,
+		Version: "99",
+		Tunnels: []proto.TunnelDef{{TunnelID: "web", Host: "app.example.com"}},
+	})
+
+	msg, _ := proto.Read(ctrl)
+	if msg.Type != proto.TypeError {
+		t.Errorf("expected version mismatch error, got %s", msg.Type)
+	}
+	if !strings.Contains(msg.Reason, "protocol version mismatch") {
+		t.Errorf("unexpected reason: %s", msg.Reason)
+	}
+}
+
+func TestServer_ProtocolVersion_Match(t *testing.T) {
+	s := newTestServer(t)
+
+	ctrl := dialControl(t, s)
+	defer ctrl.Close()
+
+	proto.Write(ctrl, proto.Message{
+		Type:    proto.TypeRegister,
+		Version: proto.Version,
+		Tunnels: []proto.TunnelDef{{TunnelID: "web", Host: "app.example.com"}},
+	})
+
+	msg, _ := proto.Read(ctrl)
+	if msg.Type != proto.TypeOK {
+		t.Errorf("expected ok, got %s reason=%s", msg.Type, msg.Reason)
+	}
+}
+
+func TestServer_ProtocolVersion_Empty(t *testing.T) {
+	s := newTestServer(t)
+
+	ctrl := dialControl(t, s)
+	defer ctrl.Close()
+
+	proto.Write(ctrl, proto.Message{
+		Type:    proto.TypeRegister,
+		Tunnels: []proto.TunnelDef{{TunnelID: "web", Host: "app.example.com"}},
+	})
+
+	msg, _ := proto.Read(ctrl)
+	if msg.Type != proto.TypeOK {
+		t.Errorf("expected ok for empty version (backward compat), got %s", msg.Type)
+	}
+}
+
+func TestServer_GracefulShutdown(t *testing.T) {
+	dir := t.TempDir()
+	cfg := serverConfig(t, "", 0, dir)
+	s := New(cfg)
+	go s.listenControl()
+	go s.listenData()
+	go s.listenHTTP()
+	go s.listenTLS()
+	time.Sleep(50 * time.Millisecond)
+
+	ctrl := dialControl(t, s)
+	proto.Write(ctrl, proto.Message{
+		Type:    proto.TypeRegister,
+		Tunnels: []proto.TunnelDef{{TunnelID: "web", Host: "app.example.com"}},
+	})
+	proto.Read(ctrl)
+	time.Sleep(50 * time.Millisecond)
+
+	if s.SessionCount() != 1 {
+		t.Fatalf("expected 1 session before shutdown")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	close(s.shutdown)
+	ctrl.Close()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Error("graceful shutdown timed out")
+	}
+}

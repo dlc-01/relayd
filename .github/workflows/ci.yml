@@ -131,6 +131,9 @@ jobs:
           Environment=RELAYD_SESSION_TTL=24h
           Environment=RELAYD_TG_TOKEN=${{ secrets.RELAYD_TG_TOKEN }}
           Environment=RELAYD_TG_CHAT_ID=${{ secrets.RELAYD_TG_CHAT_ID }}
+          RELAYD_RATE_LIMIT=100
+          RELAYD_RATE_LIMIT_WINDOW=1m
+          RELAYD_MAX_CONNS_PER_IP=10
 
           StandardOutput=journal
           StandardError=journal

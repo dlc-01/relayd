@@ -6,6 +6,8 @@ import (
 	"net"
 )
 
+const Version = "1"
+
 type MessageType string
 
 const (
@@ -27,6 +29,7 @@ type TunnelDef struct {
 
 type Message struct {
 	Type      MessageType `json:"type"`
+	Version   string      `json:"version,omitempty"`
 	Token     string      `json:"token,omitempty"`
 	TempToken string      `json:"temp_token,omitempty"`
 	ExpiresAt string      `json:"expires_at,omitempty"`

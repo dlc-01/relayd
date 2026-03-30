@@ -27,6 +27,9 @@ type ServerConfig struct {
 	AdminAddr       string
 	TGToken         string
 	TGChatID        string
+	RateLimit       int
+	RateLimitWindow time.Duration
+	MaxConnsPerIP   int
 	Dev             bool
 }
 
@@ -73,6 +76,9 @@ func LoadServerConfig() ServerConfig {
 		AdminAddr:       getEnv("RELAYD_ADMIN_ADDR", "127.0.0.1:7002"),
 		TGToken:         getEnv("RELAYD_TG_TOKEN", ""),
 		TGChatID:        getEnv("RELAYD_TG_CHAT_ID", ""),
+		RateLimit:       getEnvInt("RELAYD_RATE_LIMIT", 100),
+		RateLimitWindow: getEnvDuration("RELAYD_RATE_LIMIT_WINDOW", time.Minute),
+		MaxConnsPerIP:   getEnvInt("RELAYD_MAX_CONNS_PER_IP", 10),
 		Dev:             getEnv("RELAYD_DEV", "false") == "true",
 	}
 

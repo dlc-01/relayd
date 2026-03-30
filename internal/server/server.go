@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/dlc-01/relayd/internal/auth"
@@ -16,6 +19,7 @@ import (
 	"github.com/dlc-01/relayd/internal/notify"
 	"github.com/dlc-01/relayd/internal/portcheck"
 	"github.com/dlc-01/relayd/internal/proto"
+	"github.com/dlc-01/relayd/internal/ratelimit"
 	"github.com/dlc-01/relayd/internal/tlscerts"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -45,6 +49,9 @@ type Server struct {
 	auth        *auth.Manager
 	controlCert tls.Certificate
 	notify      notify.Notifier
+	limiter     *ratelimit.IPLimiter
+	shutdown    chan struct{}
+	wg          sync.WaitGroup
 }
 
 func New(cfg config.ServerConfig) *Server {
@@ -74,6 +81,16 @@ func New(cfg config.ServerConfig) *Server {
 	fp, _ := tlscerts.Fingerprint(cert)
 	log.Infow("control tls ready", "fingerprint", fp)
 
+	var limiter *ratelimit.IPLimiter
+	if cfg.RateLimit > 0 {
+		limiter = ratelimit.New(cfg.RateLimit, cfg.RateLimitWindow, cfg.MaxConnsPerIP)
+		log.Infow("rate limiting enabled",
+			"rate", cfg.RateLimit,
+			"window", cfg.RateLimitWindow,
+			"max_conns_per_ip", cfg.MaxConnsPerIP,
+		)
+	}
+
 	return &Server{
 		cfg:         cfg,
 		log:         log,
@@ -85,6 +102,8 @@ func New(cfg config.ServerConfig) *Server {
 		auth:        mgr,
 		controlCert: cert,
 		notify:      buildNotifier(cfg),
+		limiter:     limiter,
+		shutdown:    make(chan struct{}),
 	}
 }
 
@@ -108,7 +127,15 @@ func (s *Server) Run() {
 	go s.listenData()
 	go s.listenHTTP()
 	go s.listenTLS()
-	select {}
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-quit
+
+	s.log.Infow("shutting down gracefully", "signal", sig)
+	close(s.shutdown)
+	s.wg.Wait()
+	s.log.Infow("shutdown complete")
 }
 
 func (s *Server) listenControl() {
@@ -118,14 +145,29 @@ func (s *Server) listenControl() {
 		s.log.Fatalw("control listen failed", "addr", s.cfg.ControlAddr, "err", err)
 	}
 	s.log.Infow("control listening", "addr", s.cfg.ControlAddr)
+
+	go func() {
+		<-s.shutdown
+		ln.Close()
+	}()
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			s.log.Errorw("control accept failed", "err", err)
-			continue
+			select {
+			case <-s.shutdown:
+				return
+			default:
+				s.log.Errorw("control accept failed", "err", err)
+				continue
+			}
 		}
 		s.log.Debugw("new control connection", "remote", conn.RemoteAddr())
-		go s.handleControl(conn)
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.handleControl(conn)
+		}()
 	}
 }
 
@@ -160,105 +202,179 @@ func (s *Server) handleControl(ctrl net.Conn) {
 	defer ctrl.Close()
 	remote := ctrl.RemoteAddr().String()
 
-	msg, err := proto.Read(ctrl)
-	if err != nil || msg.Type != proto.TypeRegister {
-		s.log.Warnw("expected register", "remote", remote, "got", msg.Type, "err", err)
+	if err := s.checkRateLimit(ctrl, remote); err != nil {
+		return
+	}
+
+	msg, err := s.readRegister(ctrl, remote)
+	if err != nil {
+		return
+	}
+
+	if err := s.checkVersion(ctrl, remote, msg); err != nil {
 		return
 	}
 
 	tempToken, expiresAt, err := s.authAndIssue(msg.Token, remote)
 	if err != nil {
 		s.log.Warnw("auth failed", "remote", remote, "err", err)
-		proto.Write(ctrl, proto.Message{
-			Type:   proto.TypeError,
-			Reason: err.Error(),
-		})
+		proto.Write(ctrl, proto.Message{Type: proto.TypeError, Reason: err.Error()})
 		return
 	}
 
-	if len(msg.Tunnels) == 0 {
+	if err := s.validateTunnels(ctrl, msg.Tunnels); err != nil {
+		return
+	}
+
+	session, err := s.registerSession(ctrl, remote, msg.Tunnels)
+	if err != nil {
+		return
+	}
+
+	if err := s.sendOK(ctrl, remote, session, tempToken, expiresAt); err != nil {
+		return
+	}
+
+	s.startListeners(session)
+
+	s.log.Infow("client connected", "remote", remote, "session_id", session.id, "tunnels", len(msg.Tunnels))
+	s.notify.ClientConnected(remote, tunnelNamesFromDefs(msg.Tunnels), remote)
+
+	s.readControlLoop(ctrl, session)
+
+	s.log.Infow("client disconnected", "remote", remote, "session_id", session.id)
+	s.notify.ClientDisconnected(remote, remote)
+	s.removeSession(session)
+}
+
+func (s *Server) checkRateLimit(ctrl net.Conn, remote string) error {
+	if s.limiter == nil {
+		return nil
+	}
+	if !s.limiter.Allow(remote) {
+		s.log.Warnw("rate limit exceeded", "remote", remote)
+		proto.Write(ctrl, proto.Message{Type: proto.TypeError, Reason: "rate limit exceeded"})
+		return fmt.Errorf("rate limit exceeded")
+	}
+	if !s.limiter.ConnOpen(remote) {
+		s.log.Warnw("max conns per IP exceeded", "remote", remote)
+		proto.Write(ctrl, proto.Message{Type: proto.TypeError, Reason: "too many connections"})
+		return fmt.Errorf("too many connections")
+	}
+	// ConnClose вызывается в removeSession через defer
+	return nil
+}
+
+func (s *Server) readRegister(ctrl net.Conn, remote string) (proto.Message, error) {
+	msg, err := proto.Read(ctrl)
+	if err != nil || msg.Type != proto.TypeRegister {
+		s.log.Warnw("expected register", "remote", remote, "got", msg.Type, "err", err)
+		return proto.Message{}, fmt.Errorf("expected register")
+	}
+	return msg, nil
+}
+
+func (s *Server) checkVersion(ctrl net.Conn, remote string, msg proto.Message) error {
+	if msg.Version == "" || msg.Version == proto.Version {
+		return nil
+	}
+	s.log.Warnw("protocol version mismatch",
+		"remote", remote,
+		"server", proto.Version,
+		"client", msg.Version,
+	)
+	proto.Write(ctrl, proto.Message{
+		Type:   proto.TypeError,
+		Reason: fmt.Sprintf("protocol version mismatch: server=%s client=%s", proto.Version, msg.Version),
+	})
+	return fmt.Errorf("version mismatch")
+}
+
+func (s *Server) validateTunnels(ctrl net.Conn, tunnels []proto.TunnelDef) error {
+	if len(tunnels) == 0 {
 		proto.Write(ctrl, proto.Message{Type: proto.TypeError, Reason: "no tunnels in register"})
-		return
+		return fmt.Errorf("no tunnels")
 	}
-
-	for _, t := range msg.Tunnels {
+	for _, t := range tunnels {
 		if t.TunnelID == "" {
 			proto.Write(ctrl, proto.Message{Type: proto.TypeError, Reason: "tunnel_id cannot be empty"})
-			return
+			return fmt.Errorf("empty tunnel_id")
 		}
 		if t.PublicPort == 0 && t.Host == "" && len(t.Hosts) == 0 {
 			proto.Write(ctrl, proto.Message{
 				Type:   proto.TypeError,
 				Reason: fmt.Sprintf("tunnel %s must have public_port or host", t.TunnelID),
 			})
-			return
+			return fmt.Errorf("tunnel %s: no port or host", t.TunnelID)
 		}
 	}
 
 	s.mu.Lock()
-	for _, t := range msg.Tunnels {
+	defer s.mu.Unlock()
+
+	for _, t := range tunnels {
 		if _, ok := s.tunnels[t.TunnelID]; ok {
-			s.mu.Unlock()
 			proto.Write(ctrl, proto.Message{
 				Type:   proto.TypeError,
 				Reason: fmt.Sprintf("tunnel_id %s already in use", t.TunnelID),
 			})
-			return
+			return fmt.Errorf("tunnel_id %s already in use", t.TunnelID)
 		}
 		if t.PublicPort != 0 {
 			if existing, ok := s.ports[t.PublicPort]; ok {
-				s.mu.Unlock()
 				proto.Write(ctrl, proto.Message{
 					Type:   proto.TypeError,
 					Reason: fmt.Sprintf("port %d already in use by tunnel %s", t.PublicPort, existing),
 				})
-				return
+				return fmt.Errorf("port %d already in use", t.PublicPort)
 			}
 		}
 		if t.Host != "" {
 			if existing, ok := s.hosts[t.Host]; ok {
-				s.mu.Unlock()
 				proto.Write(ctrl, proto.Message{
 					Type:   proto.TypeError,
 					Reason: fmt.Sprintf("host %s already in use by tunnel %s", t.Host, existing),
 				})
-				return
+				return fmt.Errorf("host %s already in use", t.Host)
 			}
 		}
 		for _, h := range t.Hosts {
 			if existing, ok := s.hosts[h]; ok {
-				s.mu.Unlock()
 				proto.Write(ctrl, proto.Message{
 					Type:   proto.TypeError,
 					Reason: fmt.Sprintf("host %s already in use by tunnel %s", h, existing),
 				})
-				return
+				return fmt.Errorf("host %s already in use", h)
 			}
 		}
 	}
-	s.mu.Unlock()
 
-	for _, t := range msg.Tunnels {
+	for _, t := range tunnels {
 		if t.PublicPort != 0 {
 			if err := portcheck.Check(t.PublicPort, s.cfg.MinPublicPort, s.cfg.MaxPublicPort); err != nil {
 				proto.Write(ctrl, proto.Message{
 					Type:   proto.TypeError,
 					Reason: fmt.Sprintf("tunnel %s: %s", t.TunnelID, err.Error()),
 				})
-				return
+				return err
 			}
 		}
 	}
+	return nil
+}
 
+func (s *Server) registerSession(ctrl net.Conn, remote string, tunnels []proto.TunnelDef) (*clientSession, error) {
 	session := &clientSession{
 		id:      uuid.NewString(),
 		ctrl:    ctrl,
-		tunnels: msg.Tunnels,
+		tunnels: tunnels,
 	}
 
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	s.sessions[session.id] = session
-	for _, t := range msg.Tunnels {
+	for _, t := range tunnels {
 		s.tunnels[t.TunnelID] = ctrl
 		if t.PublicPort != 0 {
 			s.ports[t.PublicPort] = t.TunnelID
@@ -278,8 +394,10 @@ func (s *Server) handleControl(ctrl net.Conn) {
 			"aliases", t.Hosts,
 		)
 	}
-	s.mu.Unlock()
+	return session, nil
+}
 
+func (s *Server) sendOK(ctrl net.Conn, remote string, session *clientSession, tempToken, expiresAt string) error {
 	okMsg := proto.Message{Type: proto.TypeOK}
 	if tempToken != "" {
 		okMsg.TempToken = tempToken
@@ -288,36 +406,21 @@ func (s *Server) handleControl(ctrl net.Conn) {
 	if err := proto.Write(ctrl, okMsg); err != nil {
 		s.log.Errorw("write ok failed", "remote", remote, "err", err)
 		s.removeSession(session)
-		return
+		return err
 	}
+	return nil
+}
 
-	for _, t := range msg.Tunnels {
+func (s *Server) startListeners(session *clientSession) {
+	for _, t := range session.tunnels {
 		if t.PublicPort != 0 {
-			if ln := s.listenPublic(t.TunnelID, t.PublicPort, ctrl); ln != nil {
+			if ln := s.listenPublic(t.TunnelID, t.PublicPort, session.ctrl); ln != nil {
 				s.mu.Lock()
 				session.listeners = append(session.listeners, ln)
 				s.mu.Unlock()
 			}
 		}
 	}
-
-	s.log.Infow("client connected",
-		"remote", remote,
-		"session_id", session.id,
-		"tunnels", len(msg.Tunnels),
-	)
-
-	tunnelNames := tunnelNamesFromDefs(msg.Tunnels)
-	s.notify.ClientConnected(remote, tunnelNames, remote)
-	s.readControlLoop(ctrl, session)
-
-	s.log.Infow("client disconnected",
-		"remote", remote,
-		"session_id", session.id,
-	)
-
-	s.notify.ClientDisconnected(remote, remote)
-	s.removeSession(session)
 }
 
 func tunnelNamesFromDefs(tunnels []proto.TunnelDef) string {

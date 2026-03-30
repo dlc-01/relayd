@@ -97,6 +97,12 @@ Internet  ──────────────▶  VPS (relayd server)
 | Token auth | ✅ | ✅ |
 
 ---
+## Known limitations
+
+- Each incoming connection creates a new TLS data connection between client and server.
+  This is fine for long-lived connections (streaming, WebSocket) but adds ~1ms overhead
+  per short request under high concurrency.
+  Proper solution: QUIC multiplexing (planned)
 
 ## Tunnel formats
 
